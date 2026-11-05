@@ -17,3 +17,7 @@ anyhow = "1"
 async-stream = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4.45"
+
+[[bin]]
+name = "deepseek"
+path = "src/main.rs"
