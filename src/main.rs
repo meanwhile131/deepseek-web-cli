@@ -18,7 +18,6 @@ Use one <shell> block per command.  Do not wrap commands in markdown fences.
 Use multiple commands per response if possible.
 Command blocks must appear in your visible reply, never inside private reasoning."#;
 
-const MAX_SHELL_ITERS: usize = 32;
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";
 
@@ -51,10 +50,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default)
-}
-
-fn env_u32(name: &str, default: u32) -> u32 {
-    env_u64(name, default as u64).min(u32::MAX as u64) as u32
 }
 
 /// Attach the active-goal reminder to an outgoing message so the model keeps
@@ -229,10 +224,6 @@ async fn run_turn(
     // (initial + every follow-up) until the model stops.
     loop {
         iter += 1;
-        if iter > MAX_SHELL_ITERS {
-            println!("{} shell loop safety limit reached", paint("1;33", "[warn]"));
-            break;
-        }
 
         if debug_pending {
             eprintln!(
@@ -340,15 +331,14 @@ async fn main() -> Result<()> {
 
     // Rate-limit policy, tunable from the environment.
     let policy = api::RetryPolicy {
-        max_retries: env_u32("DS_MAX_RETRIES", 10),
         base: std::time::Duration::from_millis(env_u64("DS_RETRY_BASE_MS", 500)),
         cap: std::time::Duration::from_millis(env_u64("DS_RETRY_CAP_MS", 60_000)),
         min_gap: std::time::Duration::from_millis(env_u64("DS_MIN_GAP_MS", 0)),
     };
-    if policy.max_retries > 0 || !policy.min_gap.is_zero() {
+    if !policy.min_gap.is_zero() {
         eprintln!(
-            "[rate-limit] retries={} base={:?} cap={:?} min_gap={:?}",
-            policy.max_retries, policy.base, policy.cap, policy.min_gap
+            "[rate-limit] retries=unlimited base={:?} cap={:?} min_gap={:?}",
+            policy.base, policy.cap, policy.min_gap
         );
     }
     client.set_policy(policy);
@@ -414,7 +404,7 @@ async fn main() -> Result<()> {
                     goal = Some(arg.clone());
                     println!("{} {arg}", paint("32", "[goal set]"));
                     // Automatically start the model and keep reprompting it
-                    // until it marks the goal complete (or we hit the cap).
+                    // until it marks the goal complete.
                     let mut turn = 0usize;
                     loop {
                         turn += 1;

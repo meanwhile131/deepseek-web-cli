@@ -207,8 +207,6 @@ fn retry_after_value(v: &Value) -> Option<Duration> {
 /// Retry knobs, configurable from the environment in `main`.
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
-    /// Retries after the first attempt (so total tries = max_retries + 1).
-    pub max_retries: u32,
     /// First backoff step; doubles every attempt.
     pub base: Duration,
     /// Upper bound on any single wait.
@@ -221,7 +219,6 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             // Patient by default: throttling is normal and worth waiting out.
-            max_retries: 10,
             base: Duration::from_millis(500),
             cap: Duration::from_secs(60),
             min_gap: Duration::ZERO,
@@ -283,18 +280,10 @@ async fn post_json(
             let v: Value = serde_json::from_str(&text)
                 .with_context(|| format!("{label}: invalid JSON response"))?;
             if envelope_rate_limited(&v) {
-                if attempt >= policy.max_retries {
-                    bail!(
-                        "{label}: still rate limited after {} attempt(s): {}",
-                        attempt + 1,
-                        v
-                    );
-                }
                 eprintln!(
-                    "[rate-limit] {label}: throttled in response body, waiting {:?} before retry {}/{}",
+                    "[rate-limit] {label}: throttled in response body, waiting {:?} before retry {}",
                     wait,
-                    attempt + 1,
-                    policy.max_retries
+                    attempt + 1
                 );
                 tokio::time::sleep(wait).await;
                 attempt += 1;
@@ -303,7 +292,7 @@ async fn post_json(
             return Ok(v);
         }
 
-        if !is_retryable(status) || attempt >= policy.max_retries {
+        if !is_retryable(status) {
             let text = resp.text().await.unwrap_or_default();
             bail!(
                 "{label} failed after {} attempt(s): {} - {}",
@@ -314,9 +303,8 @@ async fn post_json(
         }
 
         eprintln!(
-            "[rate-limit] {label}: {status}, retry {}/{} in {:?}",
+            "[rate-limit] {label}: {status}, retry {} in {:?}",
             attempt + 1,
-            policy.max_retries,
             wait
         );
         tokio::time::sleep(wait).await;
@@ -398,7 +386,7 @@ async fn open_completion(
                 .unwrap_or(false);
 
         let retryable = is_retryable(status) || rate_limited;
-        if !retryable || attempt >= policy.max_retries {
+        if !retryable {
             bail!(
                 "completion failed after {} attempt(s): {} - {}",
                 attempt + 1,
@@ -408,12 +396,11 @@ async fn open_completion(
         }
 
         eprintln!(
-            "[rate-limit] completion: {} ({}), waiting {:?} before retry {}/{}",
+            "[rate-limit] completion: {} ({}), waiting {:?} before retry {}",
             status,
             if rate_limited { "rate limited" } else { "transient" },
             wait,
-            attempt + 1,
-            policy.max_retries
+            attempt + 1
         );
         tokio::time::sleep(wait).await;
         attempt += 1;
@@ -743,10 +730,9 @@ impl DeepSeekClient {
                             if !progressed {
                                 retry_wait = Some(backoff(attempt, policy.base, policy.cap));
                                 eprintln!(
-                                    "[rate-limit] completion: stream broke before any output ({}), waiting before retry {}/{}",
+                                    "[rate-limit] completion: stream broke before any output ({}), waiting before retry {}",
                                     e,
-                                    attempt + 1,
-                                    policy.max_retries
+                                    attempt + 1
                                 );
                                 break;
                             }
@@ -769,17 +755,9 @@ impl DeepSeekClient {
                 if retry_wait.is_some() || !progressed {
                     let wait = retry_wait
                         .unwrap_or_else(|| backoff(attempt, policy.base, policy.cap));
-                    if attempt >= policy.max_retries {
-                        yield Err(anyhow::anyhow!(
-                            "completion still rate limited or empty after {} attempt(s)",
-                            attempt + 1
-                        ));
-                        return;
-                    }
                     eprintln!(
-                        "[rate-limit] completion: no usable output (attempt {}/{}), waiting {:?} before retry",
+                        "[rate-limit] completion: no usable output (attempt {}), waiting {:?} before retry",
                         attempt + 1,
-                        policy.max_retries,
                         wait
                     );
                     tokio::time::sleep(wait).await;
