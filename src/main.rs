@@ -1,5 +1,6 @@
 mod api;
 mod color;
+mod goals;
 mod pow;
 mod sessions;
 mod shell;
@@ -206,6 +207,22 @@ fn with_goal(goal: &Option<String>, msg: &str) -> String {
 /// True when the model has declared the active goal finished.
 fn goal_completed(text: &str) -> bool {
     text.contains(GOAL_DONE)
+}
+
+/// Mirror the in-memory goal into the per-conversation store.
+///
+/// A conversation id only exists once the first message has been sent, so this
+/// runs after a turn: before that there is nothing to key the goal on, and the
+/// goal lives only in memory (it is picked up by the first `persist_goal`
+/// call).  Persisting the absence of a goal clears any stale saved entry.
+fn persist_goal(client: &api::DeepSeekClient, goal: &Option<String>) {
+    let Some(id) = client.chat_session_id() else {
+        return;
+    };
+    match goal {
+        Some(g) => goals::set(id, g),
+        None => goals::clear(id),
+    }
 }
 
 /// Streaming renderer: dims the reasoning region delimited by the think
@@ -805,7 +822,14 @@ async fn main() -> Result<()> {
                             // system prompt, so we must not prepend it again.
                             primed = true;
                             label = Some(entry.display_title().to_string());
+                            // Restore the goal that was active when this
+                            // conversation was last used, so a restart does
+                            // not lose the work in progress.
+                            goal = goals::get(&entry.id);
                             println!("{} {}", paint("32", "[resumed]"), entry.display_title());
+                            if let Some(g) = &goal {
+                                println!("{} {g}", paint("36", "[goal restored]"));
+                            }
                         }
                         Err(e) => eprintln!(
                             "{} could not load conversation: {e:#}",
@@ -832,6 +856,9 @@ async fn main() -> Result<()> {
                     Ok(Some(entry)) => match client.delete_session(&entry.id).await {
                         Ok(()) => {
                             session_cache.reset();
+                            // The conversation is gone, so its saved goal is
+                            // meaningless; drop it either way.
+                            goals::clear(&entry.id);
                             if client.chat_session_id() == Some(entry.id.as_str()) {
                                 client.reset();
                                 primed = false;
@@ -901,9 +928,11 @@ async fn main() -> Result<()> {
                     || arg.eq_ignore_ascii_case("off")
                 {
                     goal = None;
+                    persist_goal(&client, &goal);
                     println!("{}", paint("32", "[goal cleared]"));
                 } else {
                     goal = Some(arg.clone());
+                    persist_goal(&client, &goal);
                     println!("{} {arg}", paint("32", "[goal set]"));
                     // Automatically start the model and keep reprompting it
                     // until it marks the goal complete.
@@ -957,9 +986,13 @@ async fn main() -> Result<()> {
                             }
                         };
                         apply_pending_title(&client, &mut label, &mut pending_title).await;
+                        // The first turn creates the conversation id; record
+                        // the goal against it now that one exists.
+                        persist_goal(&client, &goal);
                         if completed {
                             println!("{}", paint("32", "[goal completed]"));
                             goal = None;
+                            persist_goal(&client, &goal);
                             break;
                         }
                         println!("{} reprompting model (turn {turn})", paint("36", "[goal]"));
@@ -994,6 +1027,9 @@ async fn main() -> Result<()> {
                             println!("{}", paint("32", "[goal completed]"));
                             goal = None;
                         }
+                        // Sync the store: a new conversation gets its goal
+                        // recorded, and completion clears the saved entry.
+                        persist_goal(&client, &goal);
                     }
                     // Turn cancelled by Ctrl+C: just return to the prompt.
                     Ok(TurnResult::Interrupted) => {}
