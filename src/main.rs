@@ -18,7 +18,8 @@ When you need to run a command, emit it exactly as:
 The user will execute it and reply with [SHELL OUTPUT] followed by the result.
 Use one <shell> block per command.  Do not wrap commands in markdown fences.
 Always batch multiple commands into one response.
-Command blocks must appear in your visible reply, never inside private reasoning."#;
+Command blocks must appear in your visible reply, never inside private reasoning.
+Each command has a default timeout of 120 seconds; a command that runs longer is killed. To change the timeout for a single command, add a timeout attribute in seconds (or with an s/m/h suffix), for example <shell timeout="300">long command</shell>. Omit the attribute to use the default."#;
 
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";
@@ -349,7 +350,9 @@ async fn run_turn(
         // combined follow-up so the conversation thread is kept.
         let mut combined = String::new();
         for cmd in cmds {
-            println!("\n{} {}", paint("1;35", "[shell]"), paint("35", &cmd));
+            let cmd_text = cmd.cmd.clone();
+            let cmd_timeout = cmd.timeout;
+            println!("\n{} {}", paint("1;35", "[shell]"), paint("35", &cmd_text));
             if auto_approve {
                 println!("{}", paint("2", "execute? [auto-approved]"));
             } else {
@@ -366,7 +369,7 @@ async fn run_turn(
                 }
             }
             // A failing command must not kill the session.
-            let output = match shell::run_shell(&cmd).await {
+            let output = match shell::run_shell(&cmd_text, cmd_timeout).await {
                 Ok(o) => o,
                 Err(e) => format!("[error running command: {e}]"),
             };
@@ -375,7 +378,7 @@ async fn run_turn(
                 paint("2", "--- output ---"),
                 paint("2", "--------------")
             );
-            combined.push_str(&format!("\n=== CMD: {cmd}\n{output}\n"));
+            combined.push_str(&format!("\n=== CMD: {cmd_text}\n{output}\n"));
         }
 
         if combined.is_empty() {
