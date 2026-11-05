@@ -1,22 +1,23 @@
 mod api;
 mod color;
 mod pow;
+mod sessions;
 mod shell;
 
 use anyhow::Result;
+use color::paint;
 use futures_util::StreamExt;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::io::Write;
 use std::path::PathBuf;
-use color::paint;
 
 const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with access to a local shell.
 When you need to run a command, emit it exactly as:
 <shell>command goes here</shell>
 The user will execute it and reply with [SHELL OUTPUT] followed by the result.
 Use one <shell> block per command.  Do not wrap commands in markdown fences.
-Use multiple commands per response if possible.
+Always batch multiple commands into one response.
 Command blocks must appear in your visible reply, never inside private reasoning."#;
 
 /// Token the model must include in its visible reply once the goal is done.
@@ -70,8 +71,12 @@ fn user_secrets_path() -> Option<PathBuf> {
             return Some(PathBuf::from(dir).join("deepseek-web-cli").join(".env"));
         }
     }
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".config").join("deepseek-web-cli").join(".env"))
+    std::env::var_os("HOME").map(|h| {
+        PathBuf::from(h)
+            .join(".config")
+            .join("deepseek-web-cli")
+            .join(".env")
+    })
 }
 
 /// Parse the contents of a secrets file: one `KEY=VALUE` per line.  Blank
@@ -294,8 +299,7 @@ async fn run_turn(
     debug_pending: bool,
     goal: &Option<String>,
 ) -> Result<bool> {
-    let (mut pending, mut reasoning) =
-        stream_reply(client, message, thinking, search).await?;
+    let (mut pending, mut reasoning) = stream_reply(client, message, thinking, search).await?;
     let mut completed = goal_completed(&pending) || goal_completed(&reasoning);
     let mut iter = 0usize;
 
@@ -333,9 +337,7 @@ async fn run_turn(
         }
         if cmds.is_empty() {
             if debug_pending && pending.contains("<shell>") {
-                eprintln!(
-                    "[warn] pending contains a command tag but extraction returned nothing"
-                );
+                eprintln!("[warn] pending contains a command tag but extraction returned nothing");
             }
             break;
         }
@@ -368,7 +370,11 @@ async fn run_turn(
                 Ok(o) => o,
                 Err(e) => format!("[error running command: {e}]"),
             };
-            println!("{}\n{output}\n{}", paint("2", "--- output ---"), paint("2", "--------------"));
+            println!(
+                "{}\n{output}\n{}",
+                paint("2", "--- output ---"),
+                paint("2", "--------------")
+            );
             combined.push_str(&format!("\n=== CMD: {cmd}\n{output}\n"));
         }
 
@@ -377,8 +383,7 @@ async fn run_turn(
             break;
         }
 
-        let follow_up =
-            with_goal(goal, &format!("[SHELL OUTPUT]{combined}"));
+        let follow_up = with_goal(goal, &format!("[SHELL OUTPUT]{combined}"));
         match stream_reply(client, &follow_up, thinking, search).await {
             Ok((v, r)) => {
                 if goal_completed(&v) || goal_completed(&r) {
@@ -391,6 +396,115 @@ async fn run_turn(
         }
     }
     Ok(completed)
+}
+
+/// Persist the current conversation so it can be resumed later.
+///
+/// Called after every successful turn: it records the chat session id, the
+/// conversation tip, and a label derived from the first user message when the
+/// session is new.  Failures are reported but never abort the session.
+fn remember_session(client: &api::DeepSeekClient, label: &str) {
+    let Some(id) = client.chat_session_id() else {
+        return;
+    };
+    let tip = client.last_message_id();
+    let existing = sessions::list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|e| e.id == id);
+    let label = match &existing {
+        Some(e) if !e.label.is_empty() => e.label.clone(),
+        _ => first_line(label),
+    };
+    let entry = sessions::SessionEntry {
+        id: id.to_string(),
+        label,
+        updated_at: sessions::now_secs(),
+        last_message_id: tip,
+    };
+    if let Err(e) = sessions::upsert(entry) {
+        eprintln!("{} could not save session: {e:#}", paint("1;33", "[warn]"));
+    }
+}
+
+/// Collapse a message into a short one-line label.
+fn first_line(s: &str) -> String {
+    let line = s
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut label: String = line.chars().take(60).collect();
+    if line.chars().count() > 60 {
+        label.push('\u{2026}');
+    }
+    label
+}
+
+/// Print the stored sessions, most recent first.
+fn print_sessions() {
+    let list = match sessions::list() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "{} could not read sessions: {e:#}",
+                paint("1;31", "[error]")
+            );
+            return;
+        }
+    };
+    if list.is_empty() {
+        println!(
+            "{} {}",
+            paint("36", "[sessions]"),
+            paint("2", "<none saved yet>")
+        );
+        return;
+    }
+    println!("{}", paint("1;36", "[sessions]"));
+    for (i, e) in list.iter().enumerate() {
+        let label = if e.label.is_empty() {
+            "<untitled>"
+        } else {
+            &e.label
+        };
+        let when = if e.updated_at == 0 {
+            "-".to_string()
+        } else {
+            chrono::DateTime::from_timestamp(e.updated_at as i64, 0)
+                .map(|d| {
+                    d.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|| e.updated_at.to_string())
+        };
+        let tip = match &e.last_message_id {
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string());
+                if s.chars().count() > 8 {
+                    format!("{}…", &s[..8.min(s.len())])
+                } else {
+                    s
+                }
+            }
+            None => "-".to_string(),
+        };
+        println!(
+            "  {}  {}  {}  {}",
+            paint("33", &format!("{:>2}", i + 1)),
+            paint("2", &when),
+            label,
+            paint(
+                "2",
+                &format!("(id {} tip {})", &e.id[..8.min(e.id.len())], tip)
+            ),
+        );
+    }
+    println!("{}", paint("2", "resume with: /resume <number|id-prefix>"));
 }
 
 #[tokio::main]
@@ -433,15 +547,21 @@ async fn main() -> Result<()> {
     // conversation instead of being sent as a separate startup message.
     let mut primed = false;
     let mut goal: Option<String> = None;
+    // Human-readable name for the current conversation, persisted in the store.
+    let mut label: Option<String> = None;
 
     let mut rl = DefaultEditor::new()?;
-    println!(
-        "{}",
-        paint("1;36", "DeepSeek Web CLI \u{2014} multi-turn")
-    );
+    println!("{}", paint("1;36", "DeepSeek Web CLI \u{2014} multi-turn"));
     println!("  {}   new conversation", paint("32", "/new"));
     println!("  {}   show conversation tip", paint("33", "/id"));
     println!("  {}   set/start/show/clear goal", paint("35", "/goal"));
+    println!("  {}   list saved conversations", paint("34", "/sessions"));
+    println!("  {}   resume a saved conversation", paint("34", "/resume"));
+    println!(
+        "  {}   rename the current conversation",
+        paint("34", "/label")
+    );
+    println!("  {}   forget a saved conversation", paint("34", "/forget"));
     println!("  {}   quit", paint("31", "exit"));
     println!();
 
@@ -451,8 +571,10 @@ async fn main() -> Result<()> {
         match line {
             Ok(input) if input.trim() == "exit" => break,
             Ok(input) if input.trim() == "/new" => {
+                // The old conversation stays in the store so it can be resumed.
                 client.reset();
                 primed = false;
+                label = None;
                 println!("{}", paint("32", "[new conversation started]"));
                 if let Some(g) = &goal {
                     println!("{} {g}", paint("36", "[goal retained]"));
@@ -467,9 +589,93 @@ async fn main() -> Result<()> {
                 continue;
             }
             Ok(input) if input.trim().is_empty() => continue,
-            Ok(input)
-                if input.trim() == "/goal" || input.trim().starts_with("/goal ") =>
-            {
+            Ok(input) if input.trim() == "/sessions" => {
+                print_sessions();
+                continue;
+            }
+            Ok(input) if input.trim() == "/resume" || input.trim().starts_with("/resume ") => {
+                let arg = input.trim()["/resume".len()..].trim().to_string();
+                if arg.is_empty() {
+                    print_sessions();
+                    println!("{}", paint("2", "usage: /resume <number|id-prefix>"));
+                    continue;
+                }
+                match sessions::resolve(&arg) {
+                    Ok(Some(entry)) => {
+                        client.resume(entry.id.clone(), entry.last_message_id.clone());
+                        // The remote conversation already contains the system
+                        // prompt, so we must not prepend it again.
+                        primed = true;
+                        label = if entry.label.is_empty() {
+                            None
+                        } else {
+                            Some(entry.label.clone())
+                        };
+                        let name = label.clone().unwrap_or_else(|| entry.id.clone());
+                        println!("{} {name}", paint("32", "[resumed]"));
+                    }
+                    Ok(None) => println!(
+                        "{} no unique session matches {:?}",
+                        paint("1;33", "[warn]"),
+                        arg
+                    ),
+                    Err(e) => eprintln!("{} {e:#}", paint("1;31", "[error]")),
+                }
+                continue;
+            }
+            Ok(input) if input.trim() == "/forget" || input.trim().starts_with("/forget ") => {
+                let arg = input.trim()["/forget".len()..].trim().to_string();
+                if arg.is_empty() {
+                    print_sessions();
+                    println!("{}", paint("2", "usage: /forget <number|id-prefix>"));
+                    continue;
+                }
+                match sessions::resolve(&arg) {
+                    Ok(Some(entry)) => match sessions::remove(&entry.id) {
+                        Ok(true) => println!(
+                            "{} {}",
+                            paint("32", "[forgot]"),
+                            if entry.label.is_empty() {
+                                entry.id.clone()
+                            } else {
+                                entry.label.clone()
+                            }
+                        ),
+                        Ok(false) => println!("{}", paint("1;33", "[warn] nothing to remove")),
+                        Err(e) => eprintln!("{} {e:#}", paint("1;31", "[error]")),
+                    },
+                    Ok(None) => println!(
+                        "{} no unique session matches {:?}",
+                        paint("1;33", "[warn]"),
+                        arg
+                    ),
+                    Err(e) => eprintln!("{} {e:#}", paint("1;31", "[error]")),
+                }
+                continue;
+            }
+            Ok(input) if input.trim() == "/label" || input.trim().starts_with("/label ") => {
+                let arg = input.trim()["/label".len()..].trim().to_string();
+                if arg.is_empty() {
+                    match &label {
+                        Some(l) => println!("{} {l}", paint("36", "[label]")),
+                        None => println!("{} {}", paint("36", "[label]"), paint("2", "<none>")),
+                    }
+                    continue;
+                }
+                label = Some(arg.clone());
+                if let Some(id) = client.chat_session_id() {
+                    let entry = sessions::SessionEntry {
+                        id: id.to_string(),
+                        label: arg.clone(),
+                        updated_at: sessions::now_secs(),
+                        last_message_id: client.last_message_id(),
+                    };
+                    let _ = sessions::upsert(entry);
+                }
+                println!("{} {arg}", paint("32", "[label set]"));
+                continue;
+            }
+            Ok(input) if input.trim() == "/goal" || input.trim().starts_with("/goal ") => {
                 let arg = input.trim()["/goal".len()..].trim().to_string();
                 if arg.is_empty() {
                     match &goal {
@@ -530,15 +736,16 @@ async fn main() -> Result<()> {
                                 break;
                             }
                         };
+                        if label.is_none() {
+                            label = Some(first_line(&arg));
+                        }
+                        remember_session(&client, label.as_deref().unwrap_or(""));
                         if completed {
                             println!("{}", paint("32", "[goal completed]"));
                             goal = None;
                             break;
                         }
-                        println!(
-                            "{} reprompting model (turn {turn})",
-                            paint("36", "[goal]")
-                        );
+                        println!("{} reprompting model (turn {turn})", paint("36", "[goal]"));
                     }
                 }
                 continue;
@@ -564,6 +771,10 @@ async fn main() -> Result<()> {
                 .await
                 {
                     Ok(completed) => {
+                        if label.is_none() {
+                            label = Some(first_line(&input));
+                        }
+                        remember_session(&client, label.as_deref().unwrap_or(""));
                         if completed && goal.is_some() {
                             println!("{}", paint("32", "[goal completed]"));
                             goal = None;
@@ -581,7 +792,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{goal_completed, parse_secrets, with_goal};
+    use super::{first_line, goal_completed, parse_secrets, with_goal};
 
     #[test]
     fn no_goal_is_passthrough() {
@@ -608,6 +819,20 @@ mod tests {
     fn detects_completion_marker() {
         assert!(goal_completed("all done [GOAL COMPLETE]"));
         assert!(!goal_completed("still working"));
+    }
+
+    #[test]
+    fn labels_use_first_nonblank_line() {
+        assert_eq!(first_line("\n\n  hello world  \nmore"), "hello world");
+        assert_eq!(first_line("   "), "");
+    }
+
+    #[test]
+    fn labels_are_truncated() {
+        let long = "x".repeat(100);
+        let l = first_line(&long);
+        assert_eq!(l.chars().count(), 61);
+        assert!(l.ends_with('\u{2026}'));
     }
 
     #[test]

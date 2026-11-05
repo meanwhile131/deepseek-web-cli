@@ -269,8 +269,7 @@ async fn post_json(
             .with_context(|| format!("{label}: request failed"))?;
 
         let status = resp.status();
-        let wait = retry_after(&resp)
-            .unwrap_or_else(|| backoff(attempt, policy.base, policy.cap));
+        let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt, policy.base, policy.cap));
 
         if status.is_success() {
             let text = resp
@@ -376,8 +375,7 @@ async fn open_completion(
             return Ok(resp);
         }
 
-        let wait = retry_after(&resp)
-            .unwrap_or_else(|| backoff(attempt, policy.base, policy.cap));
+        let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt, policy.base, policy.cap));
         let text = resp.text().await.unwrap_or_default();
         let rate_limited = status.as_u16() == 429
             || message_mentions_rate_limit(&text)
@@ -398,7 +396,11 @@ async fn open_completion(
         eprintln!(
             "[rate-limit] completion: {} ({}), waiting {:?} before retry {}",
             status,
-            if rate_limited { "rate limited" } else { "transient" },
+            if rate_limited {
+                "rate limited"
+            } else {
+                "transient"
+            },
             wait,
             attempt + 1
         );
@@ -449,6 +451,19 @@ impl DeepSeekClient {
     pub fn reset(&mut self) {
         self.chat_session_id = None;
         *self.last_message_id.lock().unwrap() = None;
+    }
+
+    /// The DeepSeek chat session id currently in use, if any.
+    pub fn chat_session_id(&self) -> Option<&str> {
+        self.chat_session_id.as_deref()
+    }
+
+    /// Adopt an existing conversation so the next message continues it.
+    /// `last_message_id` is the tip (last assistant message id) that the
+    /// conversation should thread from; `None` starts at the root.
+    pub fn resume(&mut self, chat_session_id: String, last_message_id: Option<Value>) {
+        self.chat_session_id = Some(chat_session_id);
+        *self.last_message_id.lock().unwrap() = last_message_id;
     }
 
     /// Expose the current conversation tip (assistant message id) for debugging.
