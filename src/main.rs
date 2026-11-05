@@ -340,9 +340,9 @@ async fn main() -> Result<()> {
 
     // Rate-limit policy, tunable from the environment.
     let policy = api::RetryPolicy {
-        max_retries: env_u32("DS_MAX_RETRIES", 6),
+        max_retries: env_u32("DS_MAX_RETRIES", 10),
         base: std::time::Duration::from_millis(env_u64("DS_RETRY_BASE_MS", 500)),
-        cap: std::time::Duration::from_millis(env_u64("DS_RETRY_CAP_MS", 30_000)),
+        cap: std::time::Duration::from_millis(env_u64("DS_RETRY_CAP_MS", 60_000)),
         min_gap: std::time::Duration::from_millis(env_u64("DS_MIN_GAP_MS", 0)),
     };
     if policy.max_retries > 0 || !policy.min_gap.is_zero() {
