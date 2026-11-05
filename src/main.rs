@@ -402,37 +402,100 @@ async fn run_turn(
 /// with `illegal count`.
 const SESSION_PAGE_SIZE: usize = 100;
 
-/// The result of listing conversations.
-struct SessionList {
-    entries: Vec<sessions::SessionEntry>,
-    /// True when the server reported more conversations than it returned.
-    truncated: bool,
-}
+/// Hard cap on cursor walks, so a misbehaving `has_more` cannot spin forever.
+const SESSION_MAX_PAGES: usize = 100;
 
-/// Fetch the user's conversations from `chat_session/fetch_page`.
+/// Conversations loaded so far, plus enough cursor state to fetch the next
+/// page.
 ///
-/// The endpoint ignores `offset` and caps `count` at 100, so at most
-/// `SESSION_PAGE_SIZE` conversations can be listed; `truncated` says whether
-/// the server holds more.
-async fn fetch_sessions(client: &api::DeepSeekClient) -> Result<SessionList> {
-    let (entries, truncated) = client.list_sessions(SESSION_PAGE_SIZE, 0).await?;
-    Ok(SessionList { entries, truncated })
+/// `fetch_page`'s `lte_cursor` is inclusive, so the entry the cursor points at
+/// comes back with the next page; `fetch_next` drops such repeats.
+#[derive(Default)]
+struct SessionCache {
+    entries: Vec<sessions::SessionEntry>,
+    /// The server says older conversations exist beyond what we hold.
+    has_more: bool,
+    /// Whether a fetch has run at all (distinguishes "empty" from "unloaded").
+    started: bool,
 }
 
-/// Print the server-side conversation list.
-async fn print_sessions(client: &api::DeepSeekClient) {
-    let listing = match fetch_sessions(client).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "{} could not list sessions: {e:#}",
-                paint("1;31", "[error]")
-            );
-            return;
+impl SessionCache {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Fetch the next page and append it. Returns how many new entries were
+    /// added.
+    async fn fetch_next(&mut self, client: &api::DeepSeekClient) -> Result<usize> {
+        // Own the cursor so the borrow on `entries` ends before we mutate it.
+        let cursor_owned = self
+            .entries
+            .last()
+            .map(|last| (last.updated_at, last.id.clone()));
+        let cursor = cursor_owned.as_ref().map(|(u, id)| (*u, id.as_str()));
+
+        let (page, has_more) = client.list_sessions(SESSION_PAGE_SIZE, cursor).await?;
+        let added = self.merge_page(page, has_more);
+        self.started = true;
+        Ok(added)
+    }
+
+    /// Append `page`, skipping ids already held, and record `has_more`.
+    ///
+    /// Returns how many new entries were added. Because `lte_cursor` is
+    /// inclusive the page repeats its cursor row, so a page that adds nothing
+    /// means paging has stalled; `has_more` is cleared in that case.
+    fn merge_page(&mut self, page: Vec<sessions::SessionEntry>, has_more: bool) -> usize {
+        let before = self.entries.len();
+        for e in page {
+            if !self.entries.iter().any(|x| x.id == e.id) {
+                self.entries.push(e);
+            }
         }
-    };
-    let list = listing.entries;
-    if list.is_empty() {
+        let added = self.entries.len() - before;
+        self.has_more = has_more && added > 0;
+        added
+    }
+
+    /// Load pages until `n` entries are available, the server runs out, or the
+    /// page cap is hit.
+    async fn ensure_len(&mut self, client: &api::DeepSeekClient, n: usize) -> Result<()> {
+        let mut pages = 0;
+        while self.entries.len() < n && self.has_more && pages < SESSION_MAX_PAGES {
+            self.fetch_next(client).await?;
+            pages += 1;
+        }
+        Ok(())
+    }
+
+    /// Load every page the server will give us (bounded by the page cap).
+    async fn ensure_all(&mut self, client: &api::DeepSeekClient) -> Result<()> {
+        let mut pages = 0;
+        while self.has_more && pages < SESSION_MAX_PAGES {
+            self.fetch_next(client).await?;
+            pages += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Print part of the loaded conversation list, numbering from `first`.
+fn print_session_rows(list: &[sessions::SessionEntry], first: usize) {
+    println!("{}", paint("1;36", "[sessions]"));
+    for (i, e) in list.iter().enumerate() {
+        println!(
+            "  {}  {}  {}  {}",
+            paint("33", &format!("{:>4}", first + i + 1)),
+            paint("2", &e.when()),
+            e.display_title(),
+            paint("2", &format!("(id {})", e.short_id())),
+        );
+    }
+}
+
+/// Print the loaded conversations, saying whether more can be loaded.
+fn print_loaded_sessions(cache: &SessionCache, from: usize) {
+    if cache.entries.is_empty() {
         println!(
             "{} {}",
             paint("36", "[sessions]"),
@@ -440,27 +503,82 @@ async fn print_sessions(client: &api::DeepSeekClient) {
         );
         return;
     }
-    println!("{}", paint("1;36", "[sessions]"));
-    for (i, e) in list.iter().enumerate() {
-        println!(
-            "  {}  {}  {}  {}",
-            paint("33", &format!("{:>2}", i + 1)),
-            paint("2", &e.when()),
-            e.display_title(),
-            paint("2", &format!("(id {})", e.short_id())),
-        );
-    }
-    if listing.truncated {
+    let from = from.min(cache.entries.len());
+    print_session_rows(&cache.entries[from..], from);
+    if cache.has_more {
         println!(
             "{} {}",
-            paint("1;33", "[warn]"),
+            paint("36", "[sessions]"),
             paint(
                 "2",
-                "showing the most recent 100; the server has older conversations that fetch_page will not page through"
+                &format!(
+                    "showing {} so far \u{2014} run /sessions more to load up to {} more",
+                    cache.entries.len(),
+                    SESSION_PAGE_SIZE
+                )
             )
         );
     }
     println!("{}", paint("2", "resume with: /resume <number|id-prefix>"));
+}
+
+/// Handle `/sessions` and `/sessions more`.
+async fn show_sessions(client: &api::DeepSeekClient, cache: &mut SessionCache, more: bool) {
+    if more && cache.started {
+        let from = cache.entries.len();
+        if !cache.has_more {
+            println!(
+                "{} {}",
+                paint("36", "[sessions]"),
+                paint("2", "no more conversations to load")
+            );
+            return;
+        }
+        match cache.fetch_next(client).await {
+            Ok(0) => println!(
+                "{} {}",
+                paint("36", "[sessions]"),
+                paint("2", "no more conversations to load")
+            ),
+            Ok(_) => print_loaded_sessions(cache, from),
+            Err(e) => eprintln!(
+                "{} could not list sessions: {e:#}",
+                paint("1;31", "[error]")
+            ),
+        }
+        return;
+    }
+
+    // A plain `/sessions` restarts from the newest conversation.
+    cache.reset();
+    match cache.fetch_next(client).await {
+        Ok(_) => print_loaded_sessions(cache, 0),
+        Err(e) => eprintln!(
+            "{} could not list sessions: {e:#}",
+            paint("1;31", "[error]")
+        ),
+    }
+}
+
+/// Resolve a user reference against the conversation list, loading more pages
+/// from the server as needed.
+///
+/// A numeric reference loads only as far as that index; a name or id prefix
+/// loads every page so the match can be found anywhere in the history.
+async fn resolve_session(
+    client: &api::DeepSeekClient,
+    cache: &mut SessionCache,
+    arg: &str,
+) -> Result<Option<sessions::SessionEntry>> {
+    let trimmed = arg.trim();
+    if !cache.started {
+        cache.fetch_next(client).await?;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(n) if n >= 1 => cache.ensure_len(client, n).await?,
+        _ => cache.ensure_all(client).await?,
+    }
+    Ok(sessions::resolve(&cache.entries, trimmed).cloned())
 }
 
 /// Apply a title the user set before any conversation existed.
@@ -484,15 +602,6 @@ async fn apply_pending_title(
         }
         Err(e) => eprintln!("{} could not apply title: {e:#}", paint("1;33", "[warn]")),
     }
-}
-
-/// Resolve a user reference against the live server list.
-async fn resolve_session(
-    client: &api::DeepSeekClient,
-    arg: &str,
-) -> Result<Option<sessions::SessionEntry>> {
-    let list = fetch_sessions(client).await?;
-    Ok(sessions::resolve(&list.entries, arg).cloned())
 }
 
 #[tokio::main]
@@ -539,13 +648,19 @@ async fn main() -> Result<()> {
     let mut label: Option<String> = None;
     // A title set before the first message, applied once a session exists.
     let mut pending_title: Option<String> = None;
+    // Conversations loaded from the server, reusable across /sessions calls.
+    let mut session_cache = SessionCache::default();
 
     let mut rl = DefaultEditor::new()?;
     println!("{}", paint("1;36", "DeepSeek Web CLI \u{2014} multi-turn"));
     println!("  {}   new conversation", paint("32", "/new"));
     println!("  {}   show conversation tip", paint("33", "/id"));
     println!("  {}   set/start/show/clear goal", paint("35", "/goal"));
-    println!("  {}   list saved conversations", paint("34", "/sessions"));
+    println!(
+        "  {}   list conversations ({} more to page)",
+        paint("34", "/sessions"),
+        paint("2", "/sessions more")
+    );
     println!("  {}   resume a saved conversation", paint("34", "/resume"));
     println!(
         "  {}   rename the current conversation",
@@ -580,18 +695,22 @@ async fn main() -> Result<()> {
                 continue;
             }
             Ok(input) if input.trim().is_empty() => continue,
-            Ok(input) if input.trim() == "/sessions" => {
-                print_sessions(&client).await;
+            Ok(input)
+                if input.trim() == "/sessions"
+                    || input.trim().eq_ignore_ascii_case("/sessions more") =>
+            {
+                let more = input.trim().eq_ignore_ascii_case("/sessions more");
+                show_sessions(&client, &mut session_cache, more).await;
                 continue;
             }
             Ok(input) if input.trim() == "/resume" || input.trim().starts_with("/resume ") => {
                 let arg = input.trim()["/resume".len()..].trim().to_string();
                 if arg.is_empty() {
-                    print_sessions(&client).await;
+                    show_sessions(&client, &mut session_cache, false).await;
                     println!("{}", paint("2", "usage: /resume <number|id-prefix>"));
                     continue;
                 }
-                match resolve_session(&client, &arg).await {
+                match resolve_session(&client, &mut session_cache, &arg).await {
                     Ok(Some(entry)) => match client.latest_message_id(&entry.id).await {
                         Ok(tip) => {
                             client.resume(entry.id.clone(), tip);
@@ -618,13 +737,14 @@ async fn main() -> Result<()> {
             Ok(input) if input.trim() == "/forget" || input.trim().starts_with("/forget ") => {
                 let arg = input.trim()["/forget".len()..].trim().to_string();
                 if arg.is_empty() {
-                    print_sessions(&client).await;
+                    show_sessions(&client, &mut session_cache, false).await;
                     println!("{}", paint("2", "usage: /forget <number|id-prefix>"));
                     continue;
                 }
-                match resolve_session(&client, &arg).await {
+                match resolve_session(&client, &mut session_cache, &arg).await {
                     Ok(Some(entry)) => match client.delete_session(&entry.id).await {
                         Ok(()) => {
+                            session_cache.reset();
                             if client.chat_session_id() == Some(entry.id.as_str()) {
                                 client.reset();
                                 primed = false;
@@ -789,7 +909,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{goal_completed, parse_secrets, with_goal};
+    use super::{goal_completed, parse_secrets, with_goal, SessionCache};
+    use crate::sessions;
 
     #[test]
     fn no_goal_is_passthrough() {
@@ -816,6 +937,44 @@ mod tests {
     fn detects_completion_marker() {
         assert!(goal_completed("all done [GOAL COMPLETE]"));
         assert!(!goal_completed("still working"));
+    }
+
+    fn entry(id: &str, updated_at: f64) -> sessions::SessionEntry {
+        sessions::SessionEntry {
+            id: id.into(),
+            title: id.into(),
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn merge_dedups_inclusive_cursor_row() {
+        let mut c = SessionCache::default();
+        assert_eq!(
+            c.merge_page(vec![entry("a", 3.0), entry("b", 2.0)], true),
+            2
+        );
+        assert!(c.has_more);
+        // The next page repeats "b" (the cursor row) before "c".
+        assert_eq!(
+            c.merge_page(vec![entry("b", 2.0), entry("c", 1.0)], false),
+            1
+        );
+        assert_eq!(
+            c.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(!c.has_more);
+    }
+
+    #[test]
+    fn merge_stops_paging_when_nothing_new() {
+        let mut c = SessionCache::default();
+        c.merge_page(vec![entry("a", 3.0)], true);
+        assert!(c.has_more);
+        // A page that only echoes the cursor row means paging stalled.
+        assert_eq!(c.merge_page(vec![entry("a", 3.0)], true), 0);
+        assert!(!c.has_more);
     }
 
     #[test]

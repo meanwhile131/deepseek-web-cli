@@ -540,20 +540,33 @@ impl DeepSeekClient {
 
     /// List the user's conversations, most recently updated first.
     ///
-    /// `count` is the page size (the server caps it at 100) and `offset` the
-    /// number already skipped. Returns the page's entries and whether the
-    /// server reported more beyond it.
+    /// `count` is the page size (the server caps it at 100). `cursor` is the
+    /// `(updated_at, id)` of the last entry already seen; the endpoint's
+    /// `lte_cursor` is inclusive, so that entry is returned again and the
+    /// caller must de-duplicate. `None` asks for the first page.
+    ///
+    /// Returns the page's entries and whether the server reported more.
     pub async fn list_sessions(
         &self,
         count: usize,
-        offset: usize,
+        cursor: Option<(f64, &str)>,
     ) -> Result<(Vec<crate::sessions::SessionEntry>, bool)> {
+        let mut query: Vec<(&str, String)> = vec![
+            ("count", count.to_string()),
+            // The cursor's `pinned` flag only selects the pinned group first;
+            // `false` walks the unpinned sessions that make up the whole list.
+            ("lte_cursor.pinned", "false".to_string()),
+        ];
+        if let Some((updated_at, id)) = cursor {
+            query.push(("lte_cursor.updated_at", format!("{updated_at}")));
+            query.push(("lte_cursor.id", id.to_string()));
+        }
         let biz = get_json(
             &self.http,
             &self.policy,
             &self.slot,
             SESSION_PAGE_URL,
-            &[("count", count.to_string()), ("offset", offset.to_string())],
+            &query,
             "chat_session/fetch_page",
         )
         .await?;
