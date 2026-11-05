@@ -11,6 +11,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::io::Write;
 use std::path::PathBuf;
+use tokio::sync::watch;
 
 const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with access to a local shell.
 When you need to run a command, emit it exactly as:
@@ -30,6 +31,58 @@ const THINK_CLOSE: &str = "\u{27EA}/THINK\u{27EB}";
 fn out(s: &str) {
     print!("{s}");
     std::io::stdout().flush().ok();
+}
+
+/// Cooperative Ctrl+C handling.
+///
+/// A background task listens for `SIGINT` and bumps a generation counter on
+/// every press.  Long-running work (streaming replies, shell commands) awaits
+/// this via `tokio::select!` so a Ctrl+C cancels just the current turn and
+/// returns control to the prompt, instead of terminating the whole process.
+///
+/// Generation counters (rather than a sticky boolean) make stale interrupts
+/// impossible: each turn subscribes fresh, so a signal delivered while sitting
+/// at the prompt cannot leak into the next turn.
+#[derive(Clone)]
+struct Interrupt {
+    tx: watch::Sender<u64>,
+}
+
+impl Interrupt {
+    fn new() -> Self {
+        let (tx, _rx) = watch::channel(0u64);
+        Self { tx }
+    }
+    fn fire(&self) {
+        self.tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.tx.subscribe()
+    }
+}
+
+/// Install the SIGINT handler that feeds `interrupt`.
+fn spawn_sigint_handler(interrupt: &Interrupt) {
+    let intr = interrupt.clone();
+    tokio::spawn(async move {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(mut sig) => {
+                while sig.recv().await.is_some() {
+                    intr.fire();
+                }
+            }
+            Err(e) => eprintln!(
+                "{} could not install Ctrl+C handler: {e}",
+                paint("1;33", "[warn]")
+            ),
+        }
+    });
+}
+
+/// How a turn ended, so callers can tell a completed turn from an aborted one.
+enum TurnResult {
+    Done { completed: bool },
+    Interrupted,
 }
 
 /// Parse a boolean-ish env var. Empty/unset falls back to `default`.
@@ -299,8 +352,17 @@ async fn run_turn(
     auto_approve: bool,
     debug_pending: bool,
     goal: &Option<String>,
-) -> Result<bool> {
-    let (mut pending, mut reasoning) = stream_reply(client, message, thinking, search).await?;
+    interrupt: &Interrupt,
+) -> Result<TurnResult> {
+    let mut rx = interrupt.subscribe();
+
+    let (mut pending, mut reasoning) = tokio::select! {
+        r = stream_reply(client, message, thinking, search) => r?,
+        _ = rx.changed() => {
+            println!("\n{}", paint("1;33", "[interrupted]"));
+            return Ok(TurnResult::Interrupted);
+        }
+    };
     let mut completed = goal_completed(&pending) || goal_completed(&reasoning);
     let mut iter = 0usize;
 
@@ -361,6 +423,10 @@ async fn run_turn(
                 let approve_prompt = format!("{} ", paint("33", "execute? [y/N]"));
                 let approved = match rl.readline(&approve_prompt) {
                     Ok(a) => a.trim().eq_ignore_ascii_case("y"),
+                    Err(ReadlineError::Interrupted) => {
+                        println!("\n{}", paint("1;33", "[interrupted]"));
+                        return Ok(TurnResult::Interrupted);
+                    }
                     Err(_) => false,
                 };
                 if !approved {
@@ -368,8 +434,13 @@ async fn run_turn(
                     continue;
                 }
             }
-            // A failing command must not kill the session.
-            let output = match shell::run_shell(&cmd_text, cmd_timeout).await {
+            let output = match tokio::select! {
+                r = shell::run_shell(&cmd_text, cmd_timeout) => r,
+                _ = rx.changed() => {
+                    println!("\n{}", paint("1;33", "[interrupted]"));
+                    return Ok(TurnResult::Interrupted);
+                }
+            } {
                 Ok(o) => o,
                 Err(e) => format!("[error running command: {e}]"),
             };
@@ -387,18 +458,20 @@ async fn run_turn(
         }
 
         let follow_up = with_goal(goal, &format!("[SHELL OUTPUT]{combined}"));
-        match stream_reply(client, &follow_up, thinking, search).await {
-            Ok((v, r)) => {
-                if goal_completed(&v) || goal_completed(&r) {
-                    completed = true;
-                }
-                pending = v;
-                reasoning = r;
+        let (v, r) = tokio::select! {
+            r = stream_reply(client, &follow_up, thinking, search) => r?,
+            _ = rx.changed() => {
+                println!("\n{}", paint("1;33", "[interrupted]"));
+                return Ok(TurnResult::Interrupted);
             }
-            Err(e) => return Err(e),
+        };
+        if goal_completed(&v) || goal_completed(&r) {
+            completed = true;
         }
+        pending = v;
+        reasoning = r;
     }
-    Ok(completed)
+    Ok(TurnResult::Done { completed })
 }
 
 /// Largest page the `fetch_page` endpoint accepts; anything above is rejected
@@ -655,6 +728,13 @@ async fn main() -> Result<()> {
     let mut session_cache = SessionCache::default();
 
     let mut rl = DefaultEditor::new()?;
+
+    // Route SIGINT to cooperative cancellation so Ctrl+C aborts the current
+    // turn instead of killing the process while the model streams or a shell
+    // command runs.
+    let interrupt = Interrupt::new();
+    spawn_sigint_handler(&interrupt);
+
     println!("{}", paint("1;36", "DeepSeek Web CLI \u{2014} multi-turn"));
     println!("  {}   new conversation", paint("32", "/new"));
     println!("  {}   show conversation tip", paint("33", "/id"));
@@ -670,7 +750,11 @@ async fn main() -> Result<()> {
         paint("34", "/label")
     );
     println!("  {}   forget a saved conversation", paint("34", "/forget"));
-    println!("  {}   quit", paint("31", "exit"));
+    println!("  {}   quit (Ctrl+D also quits)", paint("31", "exit"));
+    println!(
+        "  {} Ctrl+C cancels the current reply/command (or clears the prompt)",
+        paint("2", "tip:")
+    );
     println!();
 
     loop {
@@ -853,10 +937,20 @@ async fn main() -> Result<()> {
                             auto_approve,
                             debug_pending,
                             &goal,
+                            &interrupt,
                         )
                         .await
                         {
-                            Ok(c) => c,
+                            Ok(TurnResult::Done { completed }) => completed,
+                            Ok(TurnResult::Interrupted) => {
+                                // Stop reprompting; keep the goal so the
+                                // user can resume it with /goal.
+                                println!(
+                                    "{} goal paused \u{2014} resume with /goal <text> or /goal clear",
+                                    paint("1;33", "[interrupted]")
+                                );
+                                break;
+                            }
                             Err(e) => {
                                 eprintln!("{} {e:#}", paint("1;31", "[error]"));
                                 break;
@@ -890,20 +984,30 @@ async fn main() -> Result<()> {
                     auto_approve,
                     debug_pending,
                     &goal,
+                    &interrupt,
                 )
                 .await
                 {
-                    Ok(completed) => {
+                    Ok(TurnResult::Done { completed }) => {
                         apply_pending_title(&client, &mut label, &mut pending_title).await;
                         if completed && goal.is_some() {
                             println!("{}", paint("32", "[goal completed]"));
                             goal = None;
                         }
                     }
+                    // Turn cancelled by Ctrl+C: just return to the prompt.
+                    Ok(TurnResult::Interrupted) => {}
                     Err(e) => eprintln!("{} {e:#}", paint("1;31", "[error]")),
                 }
             }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+            // Ctrl+C at the prompt: print a freshline and show the prompt
+            // again instead of quitting.
+            Err(ReadlineError::Interrupted) => {
+                println!();
+                continue;
+            }
+            // Ctrl+D exits.
+            Err(ReadlineError::Eof) => break,
             Err(e) => eprintln!("{} readline error: {e}", paint("1;31", "[error]")),
         }
     }
