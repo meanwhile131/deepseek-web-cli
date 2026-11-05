@@ -55,6 +55,16 @@ fn env_u32(name: &str, default: u32) -> u32 {
     env_u64(name, default as u64).min(u32::MAX as u64) as u32
 }
 
+/// Attach the active-goal reminder to an outgoing message so the model keeps
+/// the user's stated objective in view on every turn (including shell
+/// follow-ups).  No goal set means the message is passed through untouched.
+fn with_goal(goal: &Option<String>, msg: &str) -> String {
+    match goal {
+        Some(g) => format!("{msg}\n\n[ACTIVE GOAL] {g}"),
+        None => msg.to_string(),
+    }
+}
+
 /// Streaming renderer: dims the reasoning region delimited by the think
 /// markers, survives markers split across chunks, and records visible
 /// (non-thinking) text and reasoning text separately.  Command extraction
@@ -220,6 +230,7 @@ async fn main() -> Result<()> {
     // The system prompt is prepended to the first user message of each
     // conversation instead of being sent as a separate startup message.
     let mut primed = false;
+    let mut goal: Option<String> = None;
 
     let mut rl = DefaultEditor::new()?;
     println!(
@@ -228,6 +239,7 @@ async fn main() -> Result<()> {
     );
     println!("  {}   new conversation", paint("32", "/new"));
     println!("  {}   show conversation tip", paint("33", "/id"));
+    println!("  {}   set/show/clear goal", paint("35", "/goal"));
     println!("  {}   quit", paint("31", "exit"));
     println!();
 
@@ -240,6 +252,9 @@ async fn main() -> Result<()> {
                 client.reset();
                 primed = false;
                 println!("{}", paint("32", "[new conversation started]"));
+                if let Some(g) = &goal {
+                    println!("{} {g}", paint("36", "[goal retained]"));
+                }
                 continue;
             }
             Ok(input) if input.trim() == "/id" => {
@@ -250,6 +265,31 @@ async fn main() -> Result<()> {
                 continue;
             }
             Ok(input) if input.trim().is_empty() => continue,
+            Ok(input)
+                if input.trim() == "/goal" || input.trim().starts_with("/goal ") =>
+            {
+                let arg = input.trim()["/goal".len()..].trim();
+                if arg.is_empty() {
+                    match &goal {
+                        Some(g) => println!("{} {g}", paint("36", "[goal]")),
+                        None => println!(
+                            "{} {}",
+                            paint("36", "[goal]"),
+                            paint("2", "<none> \u{2014} usage: /goal <text> | /goal clear")
+                        ),
+                    }
+                } else if arg.eq_ignore_ascii_case("clear")
+                    || arg.eq_ignore_ascii_case("none")
+                    || arg.eq_ignore_ascii_case("off")
+                {
+                    goal = None;
+                    println!("{}", paint("32", "[goal cleared]"));
+                } else {
+                    goal = Some(arg.to_string());
+                    println!("{} {arg}", paint("32", "[goal set]"));
+                }
+                continue;
+            }
             Ok(input) => {
                 let message = if primed {
                     input.clone()
@@ -257,6 +297,7 @@ async fn main() -> Result<()> {
                     primed = true;
                     format!("{SYSTEM_PROMPT}\n\n{input}")
                 };
+                let message = with_goal(&goal, &message);
                 let (mut pending, mut reasoning) =
                     match stream_reply(&mut client, &message, thinking, search).await {
                         Ok(v) => v,
@@ -319,7 +360,7 @@ async fn main() -> Result<()> {
                     // combined follow-up so the conversation thread is kept.
                     let mut combined = String::new();
                     for cmd in cmds {
-                        println!("\n{} {}", paint("1;34", "[shell]"), paint("1", &cmd));
+                        println!("\n{} {}", paint("1;35", "[shell]"), paint("35", &cmd));
                         if auto_approve {
                             println!("{}", paint("2", "execute? [auto-approved]"));
                         } else {
@@ -349,7 +390,8 @@ async fn main() -> Result<()> {
                         break;
                     }
 
-                    let follow_up = format!("[SHELL OUTPUT]{combined}");
+                    let follow_up =
+                        with_goal(&goal, &format!("[SHELL OUTPUT]{combined}"));
                     match stream_reply(&mut client, &follow_up, thinking, search).await {
                         Ok((v, r)) => {
                             pending = v;
@@ -367,4 +409,27 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_goal;
+
+    #[test]
+    fn no_goal_is_passthrough() {
+        assert_eq!(with_goal(&None, "hi"), "hi");
+    }
+
+    #[test]
+    fn goal_is_appended() {
+        let g = Some("fix the bug".to_string());
+        assert_eq!(with_goal(&g, "hi"), "hi\n\n[ACTIVE GOAL] fix the bug");
+    }
+
+    #[test]
+    fn goal_wraps_shell_output() {
+        let g = Some("fix the bug".to_string());
+        let msg = format!("[SHELL OUTPUT]{}", "\n=== CMD: ls\nok\n");
+        assert!(with_goal(&g, &msg).ends_with("[ACTIVE GOAL] fix the bug"));
+    }
 }
