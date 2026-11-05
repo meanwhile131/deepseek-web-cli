@@ -19,8 +19,6 @@ Use multiple commands per response if possible.
 Command blocks must appear in your visible reply, never inside private reasoning."#;
 
 const MAX_SHELL_ITERS: usize = 32;
-/// Safety cap on how many times we auto-reprompt the model to finish a goal.
-const MAX_GOAL_REPROMPTS: usize = 24;
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";
 
@@ -459,13 +457,6 @@ async fn main() -> Result<()> {
                         if completed {
                             println!("{}", paint("32", "[goal completed]"));
                             goal = None;
-                            break;
-                        }
-                        if turn >= MAX_GOAL_REPROMPTS {
-                            println!(
-                                "{} reprompt limit reached; goal stays active",
-                                paint("1;33", "[warn]")
-                            );
                             break;
                         }
                         println!(
