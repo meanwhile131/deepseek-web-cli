@@ -225,6 +225,55 @@ fn persist_goal(client: &api::DeepSeekClient, goal: &Option<String>) {
     }
 }
 
+/// Print the active goal (or a hint when none is set).
+///
+/// Shared by bare `/goal` and explicit `/goal show`/`/goal status` so both
+/// spellings report the same thing and neither can be mistaken for a new
+/// goal whose text happens to be "show".
+fn print_goal(goal: &Option<String>) {
+    match goal {
+        Some(g) => println!("{} {g}", paint("36", "[goal]")),
+        None => println!(
+            "{} {}",
+            paint("36", "[goal]"),
+            paint(
+                "2",
+                "<none> \u{2014} usage: /goal <text> | /goal show | /goal clear"
+            )
+        ),
+    }
+}
+
+/// What a `/goal ...` invocation should do.
+#[derive(Debug, PartialEq, Eq)]
+enum GoalCommand {
+    /// No argument, `show`, or `status`: report the active goal.
+    Show,
+    /// `clear`, `none`, or `off`: drop the active goal.
+    Clear,
+    /// Anything else: start working toward this goal.
+    Set(String),
+}
+
+/// Classify the text after `/goal`.
+///
+/// Kept separate from the event loop so the read-only subcommands can be
+/// tested directly: `show`/`status` must be reported, never turned into a goal
+/// whose text happens to be the word "show".
+fn parse_goal_command(arg: &str) -> GoalCommand {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.eq_ignore_ascii_case("show") || arg.eq_ignore_ascii_case("status") {
+        GoalCommand::Show
+    } else if arg.eq_ignore_ascii_case("clear")
+        || arg.eq_ignore_ascii_case("none")
+        || arg.eq_ignore_ascii_case("off")
+    {
+        GoalCommand::Clear
+    } else {
+        GoalCommand::Set(arg.to_string())
+    }
+}
+
 /// Streaming renderer: dims the reasoning region delimited by the think
 /// markers, survives markers split across chunks, and records visible
 /// (non-thinking) text and reasoning text separately.  Command extraction
@@ -914,88 +963,81 @@ async fn main() -> Result<()> {
             }
             Ok(input) if input.trim() == "/goal" || input.trim().starts_with("/goal ") => {
                 let arg = input.trim()["/goal".len()..].trim().to_string();
-                if arg.is_empty() {
-                    match &goal {
-                        Some(g) => println!("{} {g}", paint("36", "[goal]")),
-                        None => println!(
-                            "{} {}",
-                            paint("36", "[goal]"),
-                            paint("2", "<none> \u{2014} usage: /goal <text> | /goal clear")
-                        ),
+                match parse_goal_command(&arg) {
+                    // Read-only: report the goal without starting a turn.
+                    GoalCommand::Show => print_goal(&goal),
+                    GoalCommand::Clear => {
+                        goal = None;
+                        persist_goal(&client, &goal);
+                        println!("{}", paint("32", "[goal cleared]"));
                     }
-                } else if arg.eq_ignore_ascii_case("clear")
-                    || arg.eq_ignore_ascii_case("none")
-                    || arg.eq_ignore_ascii_case("off")
-                {
-                    goal = None;
-                    persist_goal(&client, &goal);
-                    println!("{}", paint("32", "[goal cleared]"));
-                } else {
-                    goal = Some(arg.clone());
-                    persist_goal(&client, &goal);
-                    println!("{} {arg}", paint("32", "[goal set]"));
-                    // Automatically start the model and keep reprompting it
-                    // until it marks the goal complete.
-                    let mut turn = 0usize;
-                    loop {
-                        turn += 1;
-                        let base = if turn == 1 {
-                            format!(
+                    GoalCommand::Set(text) => {
+                        goal = Some(text.clone());
+                        persist_goal(&client, &goal);
+                        println!("{} {text}", paint("32", "[goal set]"));
+                        // Automatically start the model and keep reprompting it
+                        // until it marks the goal complete.
+                        let mut turn = 0usize;
+                        loop {
+                            turn += 1;
+                            let base = if turn == 1 {
+                                format!(
                                 "Work toward the following goal, using the shell as needed. \
-                                 When it is fully accomplished, include the token {GOAL_DONE} in your visible reply.\n\nGoal: {arg}"
+                                 When it is fully accomplished, include the token {GOAL_DONE} in your visible reply.\n\nGoal: {text}"
                             )
-                        } else {
-                            format!(
+                            } else {
+                                format!(
                                 "Continue working toward the active goal. \
                                  When it is fully accomplished, include the token {GOAL_DONE} in your visible reply."
                             )
-                        };
-                        let base = if primed {
-                            base
-                        } else {
-                            primed = true;
-                            format!("{SYSTEM_PROMPT}\n\n{base}")
-                        };
-                        let message = with_goal(&goal, &base);
-                        let completed = match run_turn(
-                            &mut client,
-                            &mut rl,
-                            &message,
-                            thinking,
-                            search,
-                            auto_approve,
-                            debug_pending,
-                            &goal,
-                            &interrupt,
-                        )
-                        .await
-                        {
-                            Ok(TurnResult::Done { completed }) => completed,
-                            Ok(TurnResult::Interrupted) => {
-                                // Stop reprompting; keep the goal so the
-                                // user can resume it with /goal.
-                                println!(
-                                    "{} goal paused \u{2014} resume with /goal <text> or /goal clear",
+                            };
+                            let base = if primed {
+                                base
+                            } else {
+                                primed = true;
+                                format!("{SYSTEM_PROMPT}\n\n{base}")
+                            };
+                            let message = with_goal(&goal, &base);
+                            let completed = match run_turn(
+                                &mut client,
+                                &mut rl,
+                                &message,
+                                thinking,
+                                search,
+                                auto_approve,
+                                debug_pending,
+                                &goal,
+                                &interrupt,
+                            )
+                            .await
+                            {
+                                Ok(TurnResult::Done { completed }) => completed,
+                                Ok(TurnResult::Interrupted) => {
+                                    // Stop reprompting; keep the goal so the
+                                    // user can resume it with /goal.
+                                    println!(
+                                    "{} goal paused \u{2014} view with /goal show, restart with /goal <text> or drop with /goal clear",
                                     paint("1;33", "[interrupted]")
                                 );
-                                break;
-                            }
-                            Err(e) => {
-                                eprintln!("{} {e:#}", paint("1;31", "[error]"));
-                                break;
-                            }
-                        };
-                        apply_pending_title(&client, &mut label, &mut pending_title).await;
-                        // The first turn creates the conversation id; record
-                        // the goal against it now that one exists.
-                        persist_goal(&client, &goal);
-                        if completed {
-                            println!("{}", paint("32", "[goal completed]"));
-                            goal = None;
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("{} {e:#}", paint("1;31", "[error]"));
+                                    break;
+                                }
+                            };
+                            apply_pending_title(&client, &mut label, &mut pending_title).await;
+                            // The first turn creates the conversation id; record
+                            // the goal against it now that one exists.
                             persist_goal(&client, &goal);
-                            break;
+                            if completed {
+                                println!("{}", paint("32", "[goal completed]"));
+                                goal = None;
+                                persist_goal(&client, &goal);
+                                break;
+                            }
+                            println!("{} reprompting model (turn {turn})", paint("36", "[goal]"));
                         }
-                        println!("{} reprompting model (turn {turn})", paint("36", "[goal]"));
                     }
                 }
                 continue;
@@ -1052,7 +1094,9 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{goal_completed, parse_secrets, with_goal, SessionCache};
+    use super::{
+        goal_completed, parse_goal_command, parse_secrets, with_goal, GoalCommand, SessionCache,
+    };
     use crate::sessions;
 
     #[test]
@@ -1074,6 +1118,42 @@ mod tests {
         let g = Some("fix the bug".to_string());
         let msg = format!("[SHELL OUTPUT]{}", "\n=== CMD: ls\nok\n");
         assert!(with_goal(&g, &msg).contains("[ACTIVE GOAL] fix the bug"));
+    }
+
+    #[test]
+    fn goal_show_is_read_only() {
+        // The help text promises `/goal` can "show"; these must report the
+        // goal rather than starting a new one whose text is the word.
+        assert_eq!(parse_goal_command(""), GoalCommand::Show);
+        assert_eq!(parse_goal_command("   "), GoalCommand::Show);
+        assert_eq!(parse_goal_command("show"), GoalCommand::Show);
+        assert_eq!(parse_goal_command("SHOW"), GoalCommand::Show);
+        assert_eq!(parse_goal_command("status"), GoalCommand::Show);
+        assert_eq!(parse_goal_command(" Status "), GoalCommand::Show);
+    }
+
+    #[test]
+    fn goal_clear_variants() {
+        assert_eq!(parse_goal_command("clear"), GoalCommand::Clear);
+        assert_eq!(parse_goal_command("NONE"), GoalCommand::Clear);
+        assert_eq!(parse_goal_command("off"), GoalCommand::Clear);
+    }
+
+    #[test]
+    fn goal_text_is_set() {
+        assert_eq!(
+            parse_goal_command("fix the bug"),
+            GoalCommand::Set("fix the bug".to_string())
+        );
+        // A goal that merely contains "show" is still a goal to set.
+        assert_eq!(
+            parse_goal_command("make /goal show functional"),
+            GoalCommand::Set("make /goal show functional".to_string())
+        );
+        assert_eq!(
+            parse_goal_command("  trim me  "),
+            GoalCommand::Set("trim me".to_string())
+        );
     }
 
     #[test]
