@@ -19,6 +19,10 @@ Use multiple commands per response if possible.
 Command blocks must appear in your visible reply, never inside private reasoning."#;
 
 const MAX_SHELL_ITERS: usize = 32;
+/// Safety cap on how many times we auto-reprompt the model to finish a goal.
+const MAX_GOAL_REPROMPTS: usize = 24;
+/// Token the model must include in its visible reply once the goal is done.
+const GOAL_DONE: &str = "[GOAL COMPLETE]";
 
 const THINK_OPEN: &str = "\u{27EA}THINK\u{27EB}";
 const THINK_CLOSE: &str = "\u{27EA}/THINK\u{27EB}";
@@ -57,12 +61,20 @@ fn env_u32(name: &str, default: u32) -> u32 {
 
 /// Attach the active-goal reminder to an outgoing message so the model keeps
 /// the user's stated objective in view on every turn (including shell
-/// follow-ups).  No goal set means the message is passed through untouched.
+/// follow-ups), and tell it how to signal completion.  No goal set means the
+/// message is passed through untouched.
 fn with_goal(goal: &Option<String>, msg: &str) -> String {
     match goal {
-        Some(g) => format!("{msg}\n\n[ACTIVE GOAL] {g}"),
+        Some(g) => format!(
+            "{msg}\n\n[ACTIVE GOAL] {g}\nWhen the goal is fully accomplished, include the exact token {GOAL_DONE} in your visible reply."
+        ),
         None => msg.to_string(),
     }
+}
+
+/// True when the model has declared the active goal finished.
+fn goal_completed(text: &str) -> bool {
+    text.contains(GOAL_DONE)
 }
 
 /// Streaming renderer: dims the reasoning region delimited by the think
@@ -197,6 +209,122 @@ async fn stream_reply(
     Ok((visible, reasoning))
 }
 
+/// Send `message`, then keep extracting and running shell commands until the
+/// model stops asking for them.  Returns `true` if the model signalled the
+/// active goal was completed at any point during the turn.
+async fn run_turn(
+    client: &mut api::DeepSeekClient,
+    rl: &mut DefaultEditor,
+    message: &str,
+    thinking: bool,
+    search: bool,
+    auto_approve: bool,
+    debug_pending: bool,
+    goal: &Option<String>,
+) -> Result<bool> {
+    let (mut pending, mut reasoning) =
+        stream_reply(client, message, thinking, search).await?;
+    let mut completed = goal_completed(&pending) || goal_completed(&reasoning);
+    let mut iter = 0usize;
+
+    // Shell loop: keep extracting commands from each reply
+    // (initial + every follow-up) until the model stops.
+    loop {
+        iter += 1;
+        if iter > MAX_SHELL_ITERS {
+            println!("{} shell loop safety limit reached", paint("1;33", "[warn]"));
+            break;
+        }
+
+        if debug_pending {
+            eprintln!(
+                "\n[debug] iter {iter}: pending ({} bytes):\n---\n{pending}\n---",
+                pending.len()
+            );
+            if !reasoning.is_empty() {
+                eprintln!(
+                    "[debug] reasoning ({} bytes):\n---\n{reasoning}\n---",
+                    reasoning.len()
+                );
+            }
+        }
+
+        let mut cmds = shell::extract_shell_commands(&pending);
+        if cmds.is_empty() {
+            // Fallback: the model sometimes emits the tool call
+            // inside its reasoning region and leaves the visible
+            // output empty.  Recover the command from reasoning.
+            let from_reasoning = shell::extract_shell_commands(&reasoning);
+            if !from_reasoning.is_empty() {
+                println!(
+                    "{} tool call found in reasoning instead of visible output \u{2014} recovering it",
+                    paint("1;33", "[warn]")
+                );
+                cmds = from_reasoning;
+            }
+        }
+        if cmds.is_empty() {
+            if debug_pending && pending.contains("<shell>") {
+                eprintln!(
+                    "[warn] pending contains a command tag but extraction returned nothing"
+                );
+            }
+            break;
+        }
+        if debug_pending {
+            eprintln!("[debug] extracted {} command(s): {:?}", cmds.len(), cmds);
+        }
+
+        // Run every command in this batch first, then send ONE
+        // combined follow-up so the conversation thread is kept.
+        let mut combined = String::new();
+        for cmd in cmds {
+            println!("\n{} {}", paint("1;35", "[shell]"), paint("35", &cmd));
+            if auto_approve {
+                println!("{}", paint("2", "execute? [auto-approved]"));
+            } else {
+                // Use the rustyline editor so we never read raw
+                // stdin behind its back.
+                let approve_prompt = format!("{} ", paint("33", "execute? [y/N]"));
+                let approved = match rl.readline(&approve_prompt) {
+                    Ok(a) => a.trim().eq_ignore_ascii_case("y"),
+                    Err(_) => false,
+                };
+                if !approved {
+                    println!("{}", paint("2", "skipped"));
+                    continue;
+                }
+            }
+            // A failing command must not kill the session.
+            let output = match shell::run_shell(&cmd).await {
+                Ok(o) => o,
+                Err(e) => format!("[error running command: {e}]"),
+            };
+            println!("{}\n{output}\n{}", paint("2", "--- output ---"), paint("2", "--------------"));
+            combined.push_str(&format!("\n=== CMD: {cmd}\n{output}\n"));
+        }
+
+        if combined.is_empty() {
+            println!("{}", paint("2", "[all commands skipped]"));
+            break;
+        }
+
+        let follow_up =
+            with_goal(goal, &format!("[SHELL OUTPUT]{combined}"));
+        match stream_reply(client, &follow_up, thinking, search).await {
+            Ok((v, r)) => {
+                if goal_completed(&v) || goal_completed(&r) {
+                    completed = true;
+                }
+                pending = v;
+                reasoning = r;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(completed)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let session_id =
@@ -239,7 +367,7 @@ async fn main() -> Result<()> {
     );
     println!("  {}   new conversation", paint("32", "/new"));
     println!("  {}   show conversation tip", paint("33", "/id"));
-    println!("  {}   set/show/clear goal", paint("35", "/goal"));
+    println!("  {}   set/start/show/clear goal", paint("35", "/goal"));
     println!("  {}   quit", paint("31", "exit"));
     println!();
 
@@ -268,7 +396,7 @@ async fn main() -> Result<()> {
             Ok(input)
                 if input.trim() == "/goal" || input.trim().starts_with("/goal ") =>
             {
-                let arg = input.trim()["/goal".len()..].trim();
+                let arg = input.trim()["/goal".len()..].trim().to_string();
                 if arg.is_empty() {
                     match &goal {
                         Some(g) => println!("{} {g}", paint("36", "[goal]")),
@@ -285,8 +413,66 @@ async fn main() -> Result<()> {
                     goal = None;
                     println!("{}", paint("32", "[goal cleared]"));
                 } else {
-                    goal = Some(arg.to_string());
+                    goal = Some(arg.clone());
                     println!("{} {arg}", paint("32", "[goal set]"));
+                    // Automatically start the model and keep reprompting it
+                    // until it marks the goal complete (or we hit the cap).
+                    let mut turn = 0usize;
+                    loop {
+                        turn += 1;
+                        let base = if turn == 1 {
+                            format!(
+                                "Work toward the following goal, using the shell as needed. \
+                                 When it is fully accomplished, include the token {GOAL_DONE} in your visible reply.\n\nGoal: {arg}"
+                            )
+                        } else {
+                            format!(
+                                "Continue working toward the active goal. \
+                                 When it is fully accomplished, include the token {GOAL_DONE} in your visible reply."
+                            )
+                        };
+                        let base = if primed {
+                            base
+                        } else {
+                            primed = true;
+                            format!("{SYSTEM_PROMPT}\n\n{base}")
+                        };
+                        let message = with_goal(&goal, &base);
+                        let completed = match run_turn(
+                            &mut client,
+                            &mut rl,
+                            &message,
+                            thinking,
+                            search,
+                            auto_approve,
+                            debug_pending,
+                            &goal,
+                        )
+                        .await
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("{} {e:#}", paint("1;31", "[error]"));
+                                break;
+                            }
+                        };
+                        if completed {
+                            println!("{}", paint("32", "[goal completed]"));
+                            goal = None;
+                            break;
+                        }
+                        if turn >= MAX_GOAL_REPROMPTS {
+                            println!(
+                                "{} reprompt limit reached; goal stays active",
+                                paint("1;33", "[warn]")
+                            );
+                            break;
+                        }
+                        println!(
+                            "{} reprompting model (turn {turn})",
+                            paint("36", "[goal]")
+                        );
+                    }
                 }
                 continue;
             }
@@ -298,110 +484,25 @@ async fn main() -> Result<()> {
                     format!("{SYSTEM_PROMPT}\n\n{input}")
                 };
                 let message = with_goal(&goal, &message);
-                let (mut pending, mut reasoning) =
-                    match stream_reply(&mut client, &message, thinking, search).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            eprintln!("{} {e:#}", paint("1;31", "[error]"));
-                            continue;
-                        }
-                    };
-                let mut iter = 0usize;
-
-                // Shell loop: keep extracting commands from each reply
-                // (initial + every follow-up) until the model stops.
-                loop {
-                    iter += 1;
-                    if iter > MAX_SHELL_ITERS {
-                        println!("{} shell loop safety limit reached", paint("1;33", "[warn]"));
-                        break;
-                    }
-
-                    if debug_pending {
-                        eprintln!(
-                            "\n[debug] iter {iter}: pending ({} bytes):\n---\n{pending}\n---",
-                            pending.len()
-                        );
-                        if !reasoning.is_empty() {
-                            eprintln!(
-                                "[debug] reasoning ({} bytes):\n---\n{reasoning}\n---",
-                                reasoning.len()
-                            );
+                match run_turn(
+                    &mut client,
+                    &mut rl,
+                    &message,
+                    thinking,
+                    search,
+                    auto_approve,
+                    debug_pending,
+                    &goal,
+                )
+                .await
+                {
+                    Ok(completed) => {
+                        if completed && goal.is_some() {
+                            println!("{}", paint("32", "[goal completed]"));
+                            goal = None;
                         }
                     }
-
-                    let mut cmds = shell::extract_shell_commands(&pending);
-                    if cmds.is_empty() {
-                        // Fallback: the model sometimes emits the tool call
-                        // inside its reasoning region and leaves the visible
-                        // output empty.  Recover the command from reasoning.
-                        let from_reasoning = shell::extract_shell_commands(&reasoning);
-                        if !from_reasoning.is_empty() {
-                            println!(
-                                "{} tool call found in reasoning instead of visible output \u{2014} recovering it",
-                                paint("1;33", "[warn]")
-                            );
-                            cmds = from_reasoning;
-                        }
-                    }
-                    if cmds.is_empty() {
-                        if debug_pending && pending.contains("<shell>") {
-                            eprintln!(
-                                "[warn] pending contains a command tag but extraction returned nothing"
-                            );
-                        }
-                        break;
-                    }
-                    if debug_pending {
-                        eprintln!("[debug] extracted {} command(s): {:?}", cmds.len(), cmds);
-                    }
-
-                    // Run every command in this batch first, then send ONE
-                    // combined follow-up so the conversation thread is kept.
-                    let mut combined = String::new();
-                    for cmd in cmds {
-                        println!("\n{} {}", paint("1;35", "[shell]"), paint("35", &cmd));
-                        if auto_approve {
-                            println!("{}", paint("2", "execute? [auto-approved]"));
-                        } else {
-                            // Use the rustyline editor so we never read raw
-                            // stdin behind its back.
-                            let approve_prompt = format!("{} ", paint("33", "execute? [y/N]"));
-                            let approved = match rl.readline(&approve_prompt) {
-                                Ok(a) => a.trim().eq_ignore_ascii_case("y"),
-                                Err(_) => false,
-                            };
-                            if !approved {
-                                println!("{}", paint("2", "skipped"));
-                                continue;
-                            }
-                        }
-                        // A failing command must not kill the session.
-                        let output = match shell::run_shell(&cmd).await {
-                            Ok(o) => o,
-                            Err(e) => format!("[error running command: {e}]"),
-                        };
-                        println!("{}\n{output}\n{}", paint("2", "--- output ---"), paint("2", "--------------"));
-                        combined.push_str(&format!("\n=== CMD: {cmd}\n{output}\n"));
-                    }
-
-                    if combined.is_empty() {
-                        println!("{}", paint("2", "[all commands skipped]"));
-                        break;
-                    }
-
-                    let follow_up =
-                        with_goal(&goal, &format!("[SHELL OUTPUT]{combined}"));
-                    match stream_reply(&mut client, &follow_up, thinking, search).await {
-                        Ok((v, r)) => {
-                            pending = v;
-                            reasoning = r;
-                        }
-                        Err(e) => {
-                            eprintln!("{} {e:#}", paint("1;31", "[error]"));
-                            break;
-                        }
-                    }
+                    Err(e) => eprintln!("{} {e:#}", paint("1;31", "[error]")),
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
@@ -413,7 +514,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::with_goal;
+    use super::{goal_completed, with_goal};
 
     #[test]
     fn no_goal_is_passthrough() {
@@ -423,13 +524,22 @@ mod tests {
     #[test]
     fn goal_is_appended() {
         let g = Some("fix the bug".to_string());
-        assert_eq!(with_goal(&g, "hi"), "hi\n\n[ACTIVE GOAL] fix the bug");
+        assert_eq!(
+            with_goal(&g, "hi"),
+            "hi\n\n[ACTIVE GOAL] fix the bug\nWhen the goal is fully accomplished, include the exact token [GOAL COMPLETE] in your visible reply."
+        );
     }
 
     #[test]
     fn goal_wraps_shell_output() {
         let g = Some("fix the bug".to_string());
         let msg = format!("[SHELL OUTPUT]{}", "\n=== CMD: ls\nok\n");
-        assert!(with_goal(&g, &msg).ends_with("[ACTIVE GOAL] fix the bug"));
+        assert!(with_goal(&g, &msg).contains("[ACTIVE GOAL] fix the bug"));
+    }
+
+    #[test]
+    fn detects_completion_marker() {
+        assert!(goal_completed("all done [GOAL COMPLETE]"));
+        assert!(!goal_completed("still working"));
     }
 }
