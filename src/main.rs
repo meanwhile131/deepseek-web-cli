@@ -1,4 +1,5 @@
 mod api;
+mod color;
 mod pow;
 mod shell;
 
@@ -7,12 +8,14 @@ use futures_util::StreamExt;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::io::Write;
+use color::paint;
 
 const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with access to a local shell.
 When you need to run a command, emit it exactly as:
 <shell>command goes here</shell>
 The user will execute it and reply with [SHELL OUTPUT] followed by the result.
 Use one <shell> block per command.  Do not wrap commands in markdown fences.
+Use multiple commands per response if possible.
 Command blocks must appear in your visible reply, never inside private reasoning."#;
 
 const MAX_SHELL_ITERS: usize = 32;
@@ -81,7 +84,7 @@ impl Renderer {
     fn finish(&mut self, visible: &mut String, reasoning: &mut String) {
         self.drain(true, visible, reasoning);
         if self.in_think {
-            out("\x1b[0m\n");
+            out(&format!("{}\n", color::reset()));
             self.in_think = false;
         }
     }
@@ -103,13 +106,13 @@ impl Renderer {
             if self.buf.starts_with(THINK_OPEN) {
                 self.buf.drain(..THINK_OPEN.len());
                 self.in_think = true;
-                out("\x1b[2m[thinking] ");
+                out(&format!("{}[thinking] ", color::dim()));
                 continue;
             }
             if self.buf.starts_with(THINK_CLOSE) {
                 self.buf.drain(..THINK_CLOSE.len());
                 self.in_think = false;
-                out("\x1b[0m\n");
+                out(&format!("{}\n", color::reset()));
                 continue;
             }
             let partial = THINK_OPEN.starts_with(self.buf.as_str())
@@ -144,7 +147,7 @@ impl Drop for Renderer {
     /// of the session.
     fn drop(&mut self) {
         if self.in_think {
-            out("\x1b[0m\n");
+            out(&format!("{}\n", color::reset()));
             self.in_think = false;
         }
     }
@@ -219,26 +222,30 @@ async fn main() -> Result<()> {
     let mut primed = false;
 
     let mut rl = DefaultEditor::new()?;
-    println!("DeepSeek Web CLI \u{2014} multi-turn");
-    println!("  /new   new conversation");
-    println!("  /id    show conversation tip");
-    println!("  exit   quit");
+    println!(
+        "{}",
+        paint("1;36", "DeepSeek Web CLI \u{2014} multi-turn")
+    );
+    println!("  {}   new conversation", paint("32", "/new"));
+    println!("  {}   show conversation tip", paint("33", "/id"));
+    println!("  {}   quit", paint("31", "exit"));
     println!();
 
     loop {
-        let line = rl.readline(">> ");
+        let prompt = paint("1;35", ">> ");
+        let line = rl.readline(&prompt);
         match line {
             Ok(input) if input.trim() == "exit" => break,
             Ok(input) if input.trim() == "/new" => {
                 client.reset();
                 primed = false;
-                println!("[new conversation started]");
+                println!("{}", paint("32", "[new conversation started]"));
                 continue;
             }
             Ok(input) if input.trim() == "/id" => {
                 match client.last_message_id() {
-                    Some(v) => println!("[tip] {v}"),
-                    None => println!("[tip] <none yet>"),
+                    Some(v) => println!("{} {v}", paint("36", "[tip]")),
+                    None => println!("{} {}", paint("36", "[tip]"), paint("2", "<none yet>")),
                 }
                 continue;
             }
@@ -254,7 +261,7 @@ async fn main() -> Result<()> {
                     match stream_reply(&mut client, &message, thinking, search).await {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[error] {e:#}");
+                            eprintln!("{} {e:#}", paint("1;31", "[error]"));
                             continue;
                         }
                     };
@@ -265,7 +272,7 @@ async fn main() -> Result<()> {
                 loop {
                     iter += 1;
                     if iter > MAX_SHELL_ITERS {
-                        println!("[warn] shell loop safety limit reached");
+                        println!("{} shell loop safety limit reached", paint("1;33", "[warn]"));
                         break;
                     }
 
@@ -290,7 +297,8 @@ async fn main() -> Result<()> {
                         let from_reasoning = shell::extract_shell_commands(&reasoning);
                         if !from_reasoning.is_empty() {
                             println!(
-                                "[warn] tool call found in reasoning instead of visible output \u{2014} recovering it"
+                                "{} tool call found in reasoning instead of visible output \u{2014} recovering it",
+                                paint("1;33", "[warn]")
                             );
                             cmds = from_reasoning;
                         }
@@ -311,18 +319,19 @@ async fn main() -> Result<()> {
                     // combined follow-up so the conversation thread is kept.
                     let mut combined = String::new();
                     for cmd in cmds {
-                        println!("\n[shell] {cmd}");
+                        println!("\n{} {}", paint("1;34", "[shell]"), paint("1", &cmd));
                         if auto_approve {
-                            println!("execute? [auto-approved]");
+                            println!("{}", paint("2", "execute? [auto-approved]"));
                         } else {
                             // Use the rustyline editor so we never read raw
                             // stdin behind its back.
-                            let approved = match rl.readline("execute? [y/N] ") {
+                            let approve_prompt = format!("{} ", paint("33", "execute? [y/N]"));
+                            let approved = match rl.readline(&approve_prompt) {
                                 Ok(a) => a.trim().eq_ignore_ascii_case("y"),
                                 Err(_) => false,
                             };
                             if !approved {
-                                println!("skipped");
+                                println!("{}", paint("2", "skipped"));
                                 continue;
                             }
                         }
@@ -331,12 +340,12 @@ async fn main() -> Result<()> {
                             Ok(o) => o,
                             Err(e) => format!("[error running command: {e}]"),
                         };
-                        println!("--- output ---\n{output}\n--------------");
+                        println!("{}\n{output}\n{}", paint("2", "--- output ---"), paint("2", "--------------"));
                         combined.push_str(&format!("\n=== CMD: {cmd}\n{output}\n"));
                     }
 
                     if combined.is_empty() {
-                        println!("[all commands skipped]");
+                        println!("{}", paint("2", "[all commands skipped]"));
                         break;
                     }
 
@@ -347,14 +356,14 @@ async fn main() -> Result<()> {
                             reasoning = r;
                         }
                         Err(e) => {
-                            eprintln!("[error] {e:#}");
+                            eprintln!("{} {e:#}", paint("1;31", "[error]"));
                             break;
                         }
                     }
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
-            Err(e) => eprintln!("readline error: {e}"),
+            Err(e) => eprintln!("{} readline error: {e}", paint("1;31", "[error]")),
         }
     }
     Ok(())
