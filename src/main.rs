@@ -8,6 +8,7 @@ use futures_util::StreamExt;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::io::Write;
+use std::path::PathBuf;
 use color::paint;
 
 const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with access to a local shell.
@@ -50,6 +51,84 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+/// Path to the user-wide secrets file.
+///
+/// Lookup order:
+///   1. `$DS_SECRETS_FILE` (explicit override)
+///   2. `$XDG_CONFIG_HOME/deepseek-web-cli/.env`
+///   3. `~/.config/deepseek-web-cli/.env`
+fn user_secrets_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("DS_SECRETS_FILE") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join("deepseek-web-cli").join(".env"));
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".config").join("deepseek-web-cli").join(".env"))
+}
+
+/// Parse the contents of a secrets file: one `KEY=VALUE` per line.  Blank
+/// lines and `#` comments are ignored, a leading `export ` is accepted (so a
+/// shell-style `.env` keeps working), and matching single or double quotes
+/// around the value are stripped.
+fn parse_secrets(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let mut value = value.trim();
+        for q in ['"', '\''] {
+            if value.len() >= 2 && value.starts_with(q) && value.ends_with(q) {
+                value = &value[1..value.len() - 1];
+                break;
+            }
+        }
+        out.push((key.to_string(), value.to_string()));
+    }
+    out
+}
+
+/// Load the user-wide secrets file (if any) into the process environment.
+/// Variables already present in the environment are left untouched, so real
+/// environment variables always take precedence over the file.  Returns the
+/// path that was read, for diagnostics.
+fn load_user_secrets() -> Option<PathBuf> {
+    let path = user_secrets_path()?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    for (key, value) in parse_secrets(&contents) {
+        if std::env::var_os(&key).is_none() {
+            std::env::set_var(&key, &value);
+        }
+    }
+    Some(path)
+}
+
+/// Fetch a required secret, failing with a message that points at both the
+/// environment and the user-wide secrets file.
+fn require_secret(name: &str, hint: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| {
+        let where_ = user_secrets_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.config/deepseek-web-cli/.env".to_string());
+        panic!("set {name} ({hint}) in the environment or in {where_}")
+    })
 }
 
 /// Attach the active-goal reminder to an outgoing message so the model keeps
@@ -316,10 +395,17 @@ async fn run_turn(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let session_id =
-        std::env::var("DS_SESSION_ID").expect("set DS_SESSION_ID (ds_session_id cookie)");
-    let bearer = std::env::var("AUTHORIZATION_TOKEN")
-        .expect("set AUTHORIZATION_TOKEN (full 'Bearer ...' value)");
+    // Pick up secrets from the user-wide file before anything reads them.
+    let secrets_path = load_user_secrets();
+    if env_flag("DS_DEBUG_SECRETS", false) {
+        match &secrets_path {
+            Some(p) => eprintln!("[secrets] loaded {}", p.display()),
+            None => eprintln!("[secrets] no user-wide secrets file found"),
+        }
+    }
+
+    let session_id = require_secret("DS_SESSION_ID", "ds_session_id cookie");
+    let bearer = require_secret("AUTHORIZATION_TOKEN", "full 'Bearer ...' value");
 
     let debug_pending = env_flag("DS_DEBUG_PENDING", false);
     // Default OFF: executing model-authored commands without confirmation is opt-in.
@@ -495,7 +581,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{goal_completed, with_goal};
+    use super::{goal_completed, parse_secrets, with_goal};
 
     #[test]
     fn no_goal_is_passthrough() {
@@ -522,5 +608,18 @@ mod tests {
     fn detects_completion_marker() {
         assert!(goal_completed("all done [GOAL COMPLETE]"));
         assert!(!goal_completed("still working"));
+    }
+
+    #[test]
+    fn parses_secrets_file() {
+        let contents = "# a comment\n\nexport DS_SESSION_ID=abc\nAUTHORIZATION_TOKEN=\"Bearer xyz\"\nQ='v'\nnovalue\n";
+        assert_eq!(
+            parse_secrets(contents),
+            vec![
+                ("DS_SESSION_ID".to_string(), "abc".to_string()),
+                ("AUTHORIZATION_TOKEN".to_string(), "Bearer xyz".to_string()),
+                ("Q".to_string(), "v".to_string()),
+            ]
+        );
     }
 }
