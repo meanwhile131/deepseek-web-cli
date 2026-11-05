@@ -398,113 +398,101 @@ async fn run_turn(
     Ok(completed)
 }
 
-/// Persist the current conversation so it can be resumed later.
+/// Largest page the `fetch_page` endpoint accepts; anything above is rejected
+/// with `illegal count`.
+const SESSION_PAGE_SIZE: usize = 100;
+
+/// The result of listing conversations.
+struct SessionList {
+    entries: Vec<sessions::SessionEntry>,
+    /// True when the server reported more conversations than it returned.
+    truncated: bool,
+}
+
+/// Fetch the user's conversations from `chat_session/fetch_page`.
 ///
-/// Called after every successful turn: it records the chat session id, the
-/// conversation tip, and a label derived from the first user message when the
-/// session is new.  Failures are reported but never abort the session.
-fn remember_session(client: &api::DeepSeekClient, label: &str) {
-    let Some(id) = client.chat_session_id() else {
-        return;
-    };
-    let tip = client.last_message_id();
-    let existing = sessions::list()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|e| e.id == id);
-    let label = match &existing {
-        Some(e) if !e.label.is_empty() => e.label.clone(),
-        _ => first_line(label),
-    };
-    let entry = sessions::SessionEntry {
-        id: id.to_string(),
-        label,
-        updated_at: sessions::now_secs(),
-        last_message_id: tip,
-    };
-    if let Err(e) = sessions::upsert(entry) {
-        eprintln!("{} could not save session: {e:#}", paint("1;33", "[warn]"));
-    }
+/// The endpoint ignores `offset` and caps `count` at 100, so at most
+/// `SESSION_PAGE_SIZE` conversations can be listed; `truncated` says whether
+/// the server holds more.
+async fn fetch_sessions(client: &api::DeepSeekClient) -> Result<SessionList> {
+    let (entries, truncated) = client.list_sessions(SESSION_PAGE_SIZE, 0).await?;
+    Ok(SessionList { entries, truncated })
 }
 
-/// Collapse a message into a short one-line label.
-fn first_line(s: &str) -> String {
-    let line = s
-        .lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    let mut label: String = line.chars().take(60).collect();
-    if line.chars().count() > 60 {
-        label.push('\u{2026}');
-    }
-    label
-}
-
-/// Print the stored sessions, most recent first.
-fn print_sessions() {
-    let list = match sessions::list() {
+/// Print the server-side conversation list.
+async fn print_sessions(client: &api::DeepSeekClient) {
+    let listing = match fetch_sessions(client).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!(
-                "{} could not read sessions: {e:#}",
+                "{} could not list sessions: {e:#}",
                 paint("1;31", "[error]")
             );
             return;
         }
     };
+    let list = listing.entries;
     if list.is_empty() {
         println!(
             "{} {}",
             paint("36", "[sessions]"),
-            paint("2", "<none saved yet>")
+            paint("2", "<none on the server>")
         );
         return;
     }
     println!("{}", paint("1;36", "[sessions]"));
     for (i, e) in list.iter().enumerate() {
-        let label = if e.label.is_empty() {
-            "<untitled>"
-        } else {
-            &e.label
-        };
-        let when = if e.updated_at == 0 {
-            "-".to_string()
-        } else {
-            chrono::DateTime::from_timestamp(e.updated_at as i64, 0)
-                .map(|d| {
-                    d.with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d %H:%M")
-                        .to_string()
-                })
-                .unwrap_or_else(|| e.updated_at.to_string())
-        };
-        let tip = match &e.last_message_id {
-            Some(v) => {
-                let s = v
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| v.to_string());
-                if s.chars().count() > 8 {
-                    format!("{}…", &s[..8.min(s.len())])
-                } else {
-                    s
-                }
-            }
-            None => "-".to_string(),
-        };
         println!(
             "  {}  {}  {}  {}",
             paint("33", &format!("{:>2}", i + 1)),
-            paint("2", &when),
-            label,
+            paint("2", &e.when()),
+            e.display_title(),
+            paint("2", &format!("(id {})", e.short_id())),
+        );
+    }
+    if listing.truncated {
+        println!(
+            "{} {}",
+            paint("1;33", "[warn]"),
             paint(
                 "2",
-                &format!("(id {} tip {})", &e.id[..8.min(e.id.len())], tip)
-            ),
+                "showing the most recent 100; the server has older conversations that fetch_page will not page through"
+            )
         );
     }
     println!("{}", paint("2", "resume with: /resume <number|id-prefix>"));
+}
+
+/// Apply a title the user set before any conversation existed.
+///
+/// New conversations get an auto-generated server title; a `/label` issued
+/// before the first message is remembered in `pending` and pushed once the
+/// session exists.
+async fn apply_pending_title(
+    client: &api::DeepSeekClient,
+    label: &mut Option<String>,
+    pending: &mut Option<String>,
+) {
+    let Some(title) = pending.clone() else { return };
+    let Some(id) = client.chat_session_id() else {
+        return;
+    };
+    match client.rename_session(id, &title).await {
+        Ok(()) => {
+            *label = Some(title);
+            *pending = None;
+        }
+        Err(e) => eprintln!("{} could not apply title: {e:#}", paint("1;33", "[warn]")),
+    }
+}
+
+/// Resolve a user reference against the live server list.
+async fn resolve_session(
+    client: &api::DeepSeekClient,
+    arg: &str,
+) -> Result<Option<sessions::SessionEntry>> {
+    let list = fetch_sessions(client).await?;
+    Ok(sessions::resolve(&list.entries, arg).cloned())
 }
 
 #[tokio::main]
@@ -549,6 +537,8 @@ async fn main() -> Result<()> {
     let mut goal: Option<String> = None;
     // Human-readable name for the current conversation, persisted in the store.
     let mut label: Option<String> = None;
+    // A title set before the first message, applied once a session exists.
+    let mut pending_title: Option<String> = None;
 
     let mut rl = DefaultEditor::new()?;
     println!("{}", paint("1;36", "DeepSeek Web CLI \u{2014} multi-turn"));
@@ -575,6 +565,7 @@ async fn main() -> Result<()> {
                 client.reset();
                 primed = false;
                 label = None;
+                pending_title = None;
                 println!("{}", paint("32", "[new conversation started]"));
                 if let Some(g) = &goal {
                     println!("{} {g}", paint("36", "[goal retained]"));
@@ -590,30 +581,31 @@ async fn main() -> Result<()> {
             }
             Ok(input) if input.trim().is_empty() => continue,
             Ok(input) if input.trim() == "/sessions" => {
-                print_sessions();
+                print_sessions(&client).await;
                 continue;
             }
             Ok(input) if input.trim() == "/resume" || input.trim().starts_with("/resume ") => {
                 let arg = input.trim()["/resume".len()..].trim().to_string();
                 if arg.is_empty() {
-                    print_sessions();
+                    print_sessions(&client).await;
                     println!("{}", paint("2", "usage: /resume <number|id-prefix>"));
                     continue;
                 }
-                match sessions::resolve(&arg) {
-                    Ok(Some(entry)) => {
-                        client.resume(entry.id.clone(), entry.last_message_id.clone());
-                        // The remote conversation already contains the system
-                        // prompt, so we must not prepend it again.
-                        primed = true;
-                        label = if entry.label.is_empty() {
-                            None
-                        } else {
-                            Some(entry.label.clone())
-                        };
-                        let name = label.clone().unwrap_or_else(|| entry.id.clone());
-                        println!("{} {name}", paint("32", "[resumed]"));
-                    }
+                match resolve_session(&client, &arg).await {
+                    Ok(Some(entry)) => match client.latest_message_id(&entry.id).await {
+                        Ok(tip) => {
+                            client.resume(entry.id.clone(), tip);
+                            // The remote conversation already contains the
+                            // system prompt, so we must not prepend it again.
+                            primed = true;
+                            label = Some(entry.display_title().to_string());
+                            println!("{} {}", paint("32", "[resumed]"), entry.display_title());
+                        }
+                        Err(e) => eprintln!(
+                            "{} could not load conversation: {e:#}",
+                            paint("1;31", "[error]")
+                        ),
+                    },
                     Ok(None) => println!(
                         "{} no unique session matches {:?}",
                         paint("1;33", "[warn]"),
@@ -626,23 +618,25 @@ async fn main() -> Result<()> {
             Ok(input) if input.trim() == "/forget" || input.trim().starts_with("/forget ") => {
                 let arg = input.trim()["/forget".len()..].trim().to_string();
                 if arg.is_empty() {
-                    print_sessions();
+                    print_sessions(&client).await;
                     println!("{}", paint("2", "usage: /forget <number|id-prefix>"));
                     continue;
                 }
-                match sessions::resolve(&arg) {
-                    Ok(Some(entry)) => match sessions::remove(&entry.id) {
-                        Ok(true) => println!(
-                            "{} {}",
-                            paint("32", "[forgot]"),
-                            if entry.label.is_empty() {
-                                entry.id.clone()
-                            } else {
-                                entry.label.clone()
+                match resolve_session(&client, &arg).await {
+                    Ok(Some(entry)) => match client.delete_session(&entry.id).await {
+                        Ok(()) => {
+                            if client.chat_session_id() == Some(entry.id.as_str()) {
+                                client.reset();
+                                primed = false;
+                                label = None;
+                                pending_title = None;
                             }
+                            println!("{} {}", paint("32", "[deleted]"), entry.display_title());
+                        }
+                        Err(e) => eprintln!(
+                            "{} could not delete session: {e:#}",
+                            paint("1;31", "[error]")
                         ),
-                        Ok(false) => println!("{}", paint("1;33", "[warn] nothing to remove")),
-                        Err(e) => eprintln!("{} {e:#}", paint("1;31", "[error]")),
                     },
                     Ok(None) => println!(
                         "{} no unique session matches {:?}",
@@ -662,17 +656,26 @@ async fn main() -> Result<()> {
                     }
                     continue;
                 }
-                label = Some(arg.clone());
-                if let Some(id) = client.chat_session_id() {
-                    let entry = sessions::SessionEntry {
-                        id: id.to_string(),
-                        label: arg.clone(),
-                        updated_at: sessions::now_secs(),
-                        last_message_id: client.last_message_id(),
-                    };
-                    let _ = sessions::upsert(entry);
+                match client.chat_session_id() {
+                    Some(id) => match client.rename_session(id, &arg).await {
+                        Ok(()) => {
+                            label = Some(arg.clone());
+                            println!("{} {arg}", paint("32", "[label set]"));
+                        }
+                        Err(e) => eprintln!(
+                            "{} could not rename session: {e:#}",
+                            paint("1;31", "[error]")
+                        ),
+                    },
+                    None => {
+                        pending_title = Some(arg.clone());
+                        println!(
+                            "{} {arg} {}",
+                            paint("32", "[label set]"),
+                            paint("2", "(applied once a conversation starts)")
+                        );
+                    }
                 }
-                println!("{} {arg}", paint("32", "[label set]"));
                 continue;
             }
             Ok(input) if input.trim() == "/goal" || input.trim().starts_with("/goal ") => {
@@ -736,10 +739,7 @@ async fn main() -> Result<()> {
                                 break;
                             }
                         };
-                        if label.is_none() {
-                            label = Some(first_line(&arg));
-                        }
-                        remember_session(&client, label.as_deref().unwrap_or(""));
+                        apply_pending_title(&client, &mut label, &mut pending_title).await;
                         if completed {
                             println!("{}", paint("32", "[goal completed]"));
                             goal = None;
@@ -771,10 +771,7 @@ async fn main() -> Result<()> {
                 .await
                 {
                     Ok(completed) => {
-                        if label.is_none() {
-                            label = Some(first_line(&input));
-                        }
-                        remember_session(&client, label.as_deref().unwrap_or(""));
+                        apply_pending_title(&client, &mut label, &mut pending_title).await;
                         if completed && goal.is_some() {
                             println!("{}", paint("32", "[goal completed]"));
                             goal = None;
@@ -792,7 +789,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_line, goal_completed, parse_secrets, with_goal};
+    use super::{goal_completed, parse_secrets, with_goal};
 
     #[test]
     fn no_goal_is_passthrough() {
@@ -819,20 +816,6 @@ mod tests {
     fn detects_completion_marker() {
         assert!(goal_completed("all done [GOAL COMPLETE]"));
         assert!(!goal_completed("still working"));
-    }
-
-    #[test]
-    fn labels_use_first_nonblank_line() {
-        assert_eq!(first_line("\n\n  hello world  \nmore"), "hello world");
-        assert_eq!(first_line("   "), "");
-    }
-
-    #[test]
-    fn labels_are_truncated() {
-        let long = "x".repeat(100);
-        let l = first_line(&long);
-        assert_eq!(l.chars().count(), 61);
-        assert!(l.ends_with('\u{2026}'));
     }
 
     #[test]

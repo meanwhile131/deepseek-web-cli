@@ -17,6 +17,10 @@ type Slot = Arc<Mutex<Option<Instant>>>;
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
 const CHALLENGE_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 const SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
+const SESSION_PAGE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/fetch_page";
+const SESSION_TITLE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/update_title";
+const SESSION_DELETE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/delete";
+const HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
 
 // ---------------------------------------------------------------------------
 // Rate-limit / transient-failure policy
@@ -311,6 +315,69 @@ async fn post_json(
     }
 }
 
+/// GET a URL with retry on throttling / transient upstream failures and
+/// unwrap the `data.biz_data` payload. `query` is appended verbatim.
+async fn get_json(
+    http: &Client,
+    policy: &RetryPolicy,
+    slot: &Slot,
+    url: &str,
+    query: &[(&str, String)],
+    label: &str,
+) -> Result<Value> {
+    let mut attempt = 0u32;
+    loop {
+        pace(slot, policy.min_gap).await;
+        let resp = http
+            .get(url)
+            .query(query)
+            .send()
+            .await
+            .with_context(|| format!("{label}: request failed"))?;
+
+        let status = resp.status();
+        let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt, policy.base, policy.cap));
+
+        if status.is_success() {
+            let text = resp
+                .text()
+                .await
+                .with_context(|| format!("{label}: failed to read response"))?;
+            let v: Value = serde_json::from_str(&text)
+                .with_context(|| format!("{label}: invalid JSON response"))?;
+            if envelope_rate_limited(&v) {
+                eprintln!(
+                    "[rate-limit] {label}: throttled in response body, waiting {:?} before retry {}",
+                    wait,
+                    attempt + 1
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+            return Ok(v["data"]["biz_data"].clone());
+        }
+
+        if !is_retryable(status) {
+            let text = resp.text().await.unwrap_or_default();
+            bail!(
+                "{label} failed after {} attempt(s): {} - {}",
+                attempt + 1,
+                status,
+                text
+            );
+        }
+
+        eprintln!(
+            "[rate-limit] {label}: {status}, retry {} in {:?}",
+            attempt + 1,
+            wait
+        );
+        tokio::time::sleep(wait).await;
+        attempt += 1;
+    }
+}
+
 async fn fetch_challenge(
     http: &Client,
     policy: &RetryPolicy,
@@ -469,6 +536,102 @@ impl DeepSeekClient {
     /// Expose the current conversation tip (assistant message id) for debugging.
     pub fn last_message_id(&self) -> Option<Value> {
         self.last_message_id.lock().unwrap().clone()
+    }
+
+    /// List the user's conversations, most recently updated first.
+    ///
+    /// `count` is the page size (the server caps it at 100) and `offset` the
+    /// number already skipped. Returns the page's entries and whether the
+    /// server reported more beyond it.
+    pub async fn list_sessions(
+        &self,
+        count: usize,
+        offset: usize,
+    ) -> Result<(Vec<crate::sessions::SessionEntry>, bool)> {
+        let biz = get_json(
+            &self.http,
+            &self.policy,
+            &self.slot,
+            SESSION_PAGE_URL,
+            &[("count", count.to_string()), ("offset", offset.to_string())],
+            "chat_session/fetch_page",
+        )
+        .await?;
+        if biz.is_null() {
+            bail!("chat_session/fetch_page returned no data: {biz}");
+        }
+        let arr = biz
+            .get("chat_sessions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            out.push(serde_json::from_value::<crate::sessions::SessionEntry>(v)?);
+        }
+        let has_more = biz
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok((out, has_more))
+    }
+
+    /// Fetch a conversation's messages and return the id of its newest
+    /// message, which is the parent the next prompt should reply to.
+    pub async fn latest_message_id(&self, chat_session_id: &str) -> Result<Option<Value>> {
+        let biz = get_json(
+            &self.http,
+            &self.policy,
+            &self.slot,
+            HISTORY_URL,
+            &[("chat_session_id", chat_session_id.to_string())],
+            "chat/history_messages",
+        )
+        .await?;
+        // Prefer the session's declared tip, falling back to the last message.
+        if let Some(tip) = biz
+            .get("chat_session")
+            .and_then(|c| c.get("current_message_id"))
+            .filter(|v| !v.is_null())
+        {
+            return Ok(Some(tip.clone()));
+        }
+        let last = biz
+            .get("chat_messages")
+            .and_then(|m| m.as_array())
+            .and_then(|a| a.last())
+            .and_then(|m| m.get("message_id"))
+            .filter(|v| !v.is_null())
+            .cloned();
+        Ok(last)
+    }
+
+    /// Rename a conversation on the server.
+    pub async fn rename_session(&self, chat_session_id: &str, title: &str) -> Result<()> {
+        post_json(
+            &self.http,
+            &self.policy,
+            &self.slot,
+            SESSION_TITLE_URL,
+            &json!({ "chat_session_id": chat_session_id, "title": title }),
+            "chat_session/update_title",
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a conversation on the server.
+    pub async fn delete_session(&self, chat_session_id: &str) -> Result<()> {
+        post_json(
+            &self.http,
+            &self.policy,
+            &self.slot,
+            SESSION_DELETE_URL,
+            &json!({ "chat_session_id": chat_session_id }),
+            "chat_session/delete",
+        )
+        .await?;
+        Ok(())
     }
 
     async fn ensure_session(&mut self) -> Result<&str> {
