@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::pow::{ChatChallenge, SolvedChallenge};
+use tokio::sync::watch;
 
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
 
@@ -168,10 +169,11 @@ fn event_rate_limited(evt: &Value) -> bool {
         }
     }
     // Envelope-shaped event (no `p` path) carrying a code/msg.
-    if evt.get("p").is_none() && (evt.get("code").is_some() || evt.get("msg").is_some()) {
-        if envelope_rate_limited(evt) {
-            return true;
-        }
+    if evt.get("p").is_none()
+        && (evt.get("code").is_some() || evt.get("msg").is_some())
+        && envelope_rate_limited(evt)
+    {
+        return true;
     }
     if evt.get("p").and_then(|p| p.as_str()) == Some("response/status") {
         if let Some(s) = evt.get("v").and_then(|v| v.as_str()) {
@@ -258,6 +260,7 @@ async fn post_json(
     http: &Client,
     policy: &RetryPolicy,
     slot: &Slot,
+    cancel: &mut Option<watch::Receiver<u64>>,
     url: &str,
     body: &Value,
     label: &str,
@@ -288,7 +291,9 @@ async fn post_json(
                     wait,
                     attempt + 1
                 );
-                tokio::time::sleep(wait).await;
+                if sleep_or_cancel(wait, cancel).await {
+                    bail!("{label}: cancelled");
+                }
                 attempt += 1;
                 continue;
             }
@@ -310,7 +315,9 @@ async fn post_json(
             attempt + 1,
             wait
         );
-        tokio::time::sleep(wait).await;
+        if sleep_or_cancel(wait, cancel).await {
+            bail!("{label}: cancelled");
+        }
         attempt += 1;
     }
 }
@@ -321,6 +328,7 @@ async fn get_json(
     http: &Client,
     policy: &RetryPolicy,
     slot: &Slot,
+    cancel: &mut Option<watch::Receiver<u64>>,
     url: &str,
     query: &[(&str, String)],
     label: &str,
@@ -351,7 +359,9 @@ async fn get_json(
                     wait,
                     attempt + 1
                 );
-                tokio::time::sleep(wait).await;
+                if sleep_or_cancel(wait, cancel).await {
+                    bail!("{label}: cancelled");
+                }
                 attempt += 1;
                 continue;
             }
@@ -373,7 +383,9 @@ async fn get_json(
             attempt + 1,
             wait
         );
-        tokio::time::sleep(wait).await;
+        if sleep_or_cancel(wait, cancel).await {
+            bail!("{label}: cancelled");
+        }
         attempt += 1;
     }
 }
@@ -382,11 +394,13 @@ async fn fetch_challenge(
     http: &Client,
     policy: &RetryPolicy,
     slot: &Slot,
+    cancel: &mut Option<watch::Receiver<u64>>,
 ) -> Result<ChatChallenge> {
     let raw = post_json(
         http,
         policy,
         slot,
+        cancel,
         CHALLENGE_URL,
         &json!({ "target_path": "/api/v0/chat/completion" }),
         "create_pow_challenge",
@@ -405,13 +419,14 @@ async fn open_completion(
     http: &Client,
     policy: &RetryPolicy,
     slot: &Slot,
+    cancel: &mut Option<watch::Receiver<u64>>,
     body: &Value,
 ) -> Result<Response> {
     let mut attempt = 0u32;
     loop {
         pace(slot, policy.min_gap).await;
 
-        let challenge = fetch_challenge(http, policy, slot).await?;
+        let challenge = fetch_challenge(http, policy, slot, cancel).await?;
         let answer = challenge
             .solve()
             .ok_or_else(|| anyhow::anyhow!("PoW solving failed"))?;
@@ -476,8 +491,48 @@ async fn open_completion(
     }
 }
 
+/// Wait for `dur`, returning `true` if the turn was cancelled meanwhile.
+///
+/// Retries can sleep for up to `policy.cap`, so without this a Ctrl+C during a
+/// throttled retry would look like a hang. Any interrupt raised *before* this
+/// call is discarded first, so a stray Ctrl+C at the prompt cannot cancel the
+/// next request.
+async fn sleep_or_cancel(dur: Duration, cancel: &mut Option<watch::Receiver<u64>>) -> bool {
+    let Some(rx) = cancel else {
+        tokio::time::sleep(dur).await;
+        return false;
+    };
+    rx.borrow_and_update();
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => false,
+        _ = rx.changed() => true,
+    }
+}
+
+/// Build the shared HTTP client.
+///
+/// A stalled connection must not hang a turn forever, so both connect and
+/// overall request timeouts are set (override with `DS_HTTP_TIMEOUT_MS`).
+fn build_http(headers: header::HeaderMap, timeout: Option<Duration>) -> Result<Client> {
+    let timeout = timeout.unwrap_or(Duration::from_secs(180));
+    Ok(Client::builder()
+        .default_headers(headers)
+        .cookie_store(true)
+        .connect_timeout(timeout.min(Duration::from_secs(30)))
+        .timeout(timeout)
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
+        .build()?)
+}
+
 pub struct DeepSeekClient {
     http: Client,
+    /// Kept so the client can be rebuilt when the timeout changes.
+    headers: header::HeaderMap,
+    /// Cancellation channel for the current turn, if any.
+    cancel: Option<watch::Receiver<u64>>,
     chat_session_id: Option<String>,
     last_message_id: Arc<Mutex<Option<Value>>>,
     policy: RetryPolicy,
@@ -493,15 +548,10 @@ impl DeepSeekClient {
             format!("ds_session_id={}", session_id).parse()?,
         );
         headers.insert(header::AUTHORIZATION, bearer.parse()?);
-        let http = Client::builder()
-            .default_headers(headers)
-            .cookie_store(true)
-            .user_agent(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            )
-            .build()?;
+        let http = build_http(headers.clone(), None)?;
         Ok(Self {
+            headers,
+            cancel: None,
             http,
             chat_session_id: None,
             last_message_id: Arc::new(Mutex::new(None)),
@@ -512,6 +562,20 @@ impl DeepSeekClient {
 
     pub fn set_policy(&mut self, policy: RetryPolicy) {
         self.policy = policy;
+    }
+
+    /// Subscribe to the turn-cancellation channel (Ctrl+C).
+    pub fn set_cancel(&mut self, cancel: watch::Receiver<u64>) {
+        self.cancel = Some(cancel);
+    }
+
+    /// Rebuild the HTTP client with an overall request timeout. Applies to
+    /// requests made after this call.
+    pub fn set_http_timeout(&mut self, timeout: Duration) {
+        match build_http(self.headers.clone(), Some(timeout)) {
+            Ok(c) => self.http = c,
+            Err(e) => eprintln!("[warn] could not apply HTTP timeout: {e:#}"),
+        }
     }
 
     /// Wipe the conversation state - next send_message starts a fresh session.
@@ -551,6 +615,7 @@ impl DeepSeekClient {
         count: usize,
         cursor: Option<(f64, &str)>,
     ) -> Result<(Vec<crate::sessions::SessionEntry>, bool)> {
+        let mut cancel = self.cancel.clone();
         let mut query: Vec<(&str, String)> = vec![
             ("count", count.to_string()),
             // The cursor's `pinned` flag only selects the pinned group first;
@@ -565,6 +630,7 @@ impl DeepSeekClient {
             &self.http,
             &self.policy,
             &self.slot,
+            &mut cancel,
             SESSION_PAGE_URL,
             &query,
             "chat_session/fetch_page",
@@ -592,10 +658,12 @@ impl DeepSeekClient {
     /// Fetch a conversation's messages and return the id of its newest
     /// message, which is the parent the next prompt should reply to.
     pub async fn latest_message_id(&self, chat_session_id: &str) -> Result<Option<Value>> {
+        let mut cancel = self.cancel.clone();
         let biz = get_json(
             &self.http,
             &self.policy,
             &self.slot,
+            &mut cancel,
             HISTORY_URL,
             &[("chat_session_id", chat_session_id.to_string())],
             "chat/history_messages",
@@ -621,10 +689,12 @@ impl DeepSeekClient {
 
     /// Rename a conversation on the server.
     pub async fn rename_session(&self, chat_session_id: &str, title: &str) -> Result<()> {
+        let mut cancel = self.cancel.clone();
         post_json(
             &self.http,
             &self.policy,
             &self.slot,
+            &mut cancel,
             SESSION_TITLE_URL,
             &json!({ "chat_session_id": chat_session_id, "title": title }),
             "chat_session/update_title",
@@ -635,10 +705,12 @@ impl DeepSeekClient {
 
     /// Delete a conversation on the server.
     pub async fn delete_session(&self, chat_session_id: &str) -> Result<()> {
+        let mut cancel = self.cancel.clone();
         post_json(
             &self.http,
             &self.policy,
             &self.slot,
+            &mut cancel,
             SESSION_DELETE_URL,
             &json!({ "chat_session_id": chat_session_id }),
             "chat_session/delete",
@@ -649,10 +721,12 @@ impl DeepSeekClient {
 
     async fn ensure_session(&mut self) -> Result<&str> {
         if self.chat_session_id.is_none() {
+            let mut cancel = self.cancel.clone();
             let resp = post_json(
                 &self.http,
                 &self.policy,
                 &self.slot,
+                &mut cancel,
                 SESSION_URL,
                 &json!({}),
                 "chat_session/create",
@@ -702,6 +776,7 @@ impl DeepSeekClient {
 
         let http = self.http.clone();
         let policy = self.policy;
+        let mut cancel = self.cancel.clone();
         let slot = self.slot.clone();
         let last_id = self.last_message_id.clone();
 
@@ -733,7 +808,7 @@ impl DeepSeekClient {
             }
 
             'retry: loop {
-                let resp = match open_completion(&http, &policy, &slot, &body).await {
+                let resp = match open_completion(&http, &policy, &slot, &mut cancel, &body).await {
                     Ok(r) => r,
                     Err(e) => {
                         yield Err(e);
@@ -951,7 +1026,9 @@ impl DeepSeekClient {
                         attempt + 1,
                         wait
                     );
-                    tokio::time::sleep(wait).await;
+                    if sleep_or_cancel(wait, &mut cancel).await {
+                        return;
+                    }
                     attempt += 1;
                     // Reset per-attempt parser state; nothing was emitted yet.
                     in_think = false;

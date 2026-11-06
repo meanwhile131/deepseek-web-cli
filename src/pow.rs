@@ -2,12 +2,12 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct ChatChallenge {
     pub challenge: InnerChallenge,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct InnerChallenge {
     pub algorithm: String,
     pub challenge: String,
@@ -47,21 +47,63 @@ impl ChatChallenge {
     }
 }
 
+/// Keccak-256 rate in bytes: the most a single-block PoW input may occupy.
+const RATE: usize = 136;
+
 impl InnerChallenge {
+    /// True when `expire_at` (epoch milliseconds) is in the past.
+    pub fn is_expired(&self) -> bool {
+        if self.expire_at == 0 {
+            return false;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.expire_at < now_ms
+    }
+
     pub fn solve(&self) -> Option<u64> {
-        if self.algorithm != "DeepSeekHashV1" {
+        if self.algorithm != "DeepSeekHashV1" || self.is_expired() {
             return None;
         }
-        let expire = self.expire_at;
-        let salt = self.salt.clone();
-        let target = self.challenge.clone();
-        (0..self.difficulty)
-            .into_par_iter()
-            .find_any(move |&guess| {
-                let text = format!("{}_{}_{}", salt, expire, guess);
-                hex::encode(deepseek_hash_v1(text.as_bytes())) == target
-            })
+        // Decode the target once and build the `salt_expire_` prefix once,
+        // rather than formatting and hex-encoding a fresh string per guess.
+        let target: [u8; 32] = hex::decode(&self.challenge).ok()?.try_into().ok()?;
+        let prefix = format!("{}_{}_", self.salt, self.expire_at);
+        (0..self.difficulty).into_par_iter().find_any(|&guess| {
+            let mut buf = [0u8; RATE];
+            let n = write_candidate(&mut buf, prefix.as_bytes(), guess);
+            n != 0 && deepseek_hash_v1(&buf[..n]) == target
+        })
     }
+}
+
+/// Write `prefix` followed by the decimal form of `guess` into `buf`.
+///
+/// Returns the number of bytes written, or 0 when it would not fit. Keeping
+/// this allocation-free matters: it runs once per hash attempt.
+fn write_candidate(buf: &mut [u8], prefix: &[u8], guess: u64) -> usize {
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    let mut v = guess;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    let end = prefix.len() + n;
+    if end > buf.len() {
+        return 0;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix);
+    for i in 0..n {
+        buf[prefix.len() + i] = digits[n - 1 - i];
+    }
+    end
 }
 
 // Standard Keccak-f[1600] round constants (24 rounds).
@@ -150,7 +192,6 @@ fn keccak_f_1600(state: &mut [u64; 25]) {
 }
 
 pub fn deepseek_hash_v1(input: &[u8]) -> [u8; 32] {
-    const RATE: usize = 136;
     assert!(input.len() < RATE - 1, "PoW input must be single-block");
 
     let mut state = [0u64; 25];

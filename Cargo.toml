@@ -12,12 +12,17 @@ base64 = "0.22"
 rustyline = "14"
 rayon = "1.10"
 hex = "0.4"
+libc = "0.2"
 futures-util = "0.3"
 anyhow = "1"
 async-stream = "0.3"
-uuid = { version = "1", features = ["v4"] }
 chrono = "0.4.45"
 
 [[bin]]
 name = "deepseek"
 path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

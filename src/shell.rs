@@ -1,5 +1,12 @@
-use anyhow::Result;
+//! Shell command extraction and execution.
+//!
+//! Commands are extracted from model output, run under `sh -c` with a
+//! wall-clock limit, and their output is bounded and sanitized before it is
+//! echoed back to the model.
+
+use anyhow::{Context, Result};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -10,14 +17,35 @@ use tokio::process::Command;
 /// command with a `timeout` attribute on the opening shell tag.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
-/// Default timeout as a `Duration`.
+/// Default cap on the bytes of output kept per stream (stdout, stderr).
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024;
+
+/// Smallest accepted output cap; below this the truncation marker dominates.
+const MIN_OUTPUT_BYTES: usize = 256;
+
+/// Default timeout, overridable with `DS_SHELL_TIMEOUT_SECS`.
 pub fn default_timeout() -> Duration {
-    std::env::var("DS_SHELL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("DS_SHELL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+    })
+}
+
+/// Per-stream output cap in bytes, overridable with `DS_SHELL_MAX_OUTPUT_BYTES`.
+pub fn max_output_bytes() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("DS_SHELL_MAX_OUTPUT_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= MIN_OUTPUT_BYTES)
+            .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+    })
 }
 
 /// A shell command extracted from model output, plus its per-use timeout.
@@ -29,22 +57,43 @@ pub struct ShellCommand {
 
 /// Run `cmd` under `sh -c`, killing it if it exceeds `timeout`.
 ///
-/// On timeout the child is killed (via `kill_on_drop`) and a descriptive
-/// message is returned as normal output so the model can react to it.
+/// stdin is `/dev/null` so an interactive command cannot fight the line editor
+/// for the terminal. On timeout the child *and its process group* are killed,
+/// so backgrounded grandchildren do not outlive the turn; the model is told
+/// about it as ordinary output. Output is truncated to `max_output_bytes()`
+/// per stream and stripped of anything that looks like a tool-call tag.
 pub async fn run_shell(cmd: &str, timeout: Duration) -> Result<String> {
-    let child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    // Give the command its own process group so the whole tree can be
+    // signalled at once on timeout.
+    command.process_group(0);
+
+    let child = command.spawn().context("failed to spawn shell")?;
+    #[cfg(unix)]
+    let pid = child.id();
 
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(res) => res?,
+        Ok(res) => res.context("failed to run shell command")?,
         Err(_) => {
-            // `wait_with_output` was dropped, which (with kill_on_drop)
-            // terminates the child process.
+            // Dropping the wait future kills the direct child; the group
+            // signal below takes care of anything it forked.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                // SAFETY: kill(2) with a negative pid signals the process
+                // group led by `pid`, which we created above. ESRCH (already
+                // gone) is fine and ignored.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
             return Ok(format!(
                 "[command timed out after {}s and was killed]",
                 timeout.as_secs_f64()
@@ -52,15 +101,68 @@ pub async fn run_shell(cmd: &str, timeout: Duration) -> Result<String> {
         }
     };
 
+    let cap = max_output_bytes();
     let mut result = String::new();
     if !output.stdout.is_empty() {
-        result.push_str(&String::from_utf8_lossy(&output.stdout));
+        result.push_str(&bounded_output(&output.stdout, cap));
     }
     if !output.stderr.is_empty() {
         result.push_str("\n[stderr]\n");
-        result.push_str(&String::from_utf8_lossy(&output.stderr));
+        result.push_str(&bounded_output(&output.stderr, cap));
+    }
+    match output.status.code() {
+        Some(0) => {}
+        Some(code) => result.push_str(&format!("\n[exit status: {code}]")),
+        None => result.push_str("\n[terminated by signal]"),
     }
     Ok(result)
+}
+
+/// Decode, sanitize and cap one stream of command output.
+fn bounded_output(bytes: &[u8], cap: usize) -> String {
+    sanitize_output(&truncate_middle(&String::from_utf8_lossy(bytes), cap))
+}
+
+/// Keep the head and tail of `s`, replacing the middle when it is longer than
+/// `cap` bytes. Splits only on character boundaries.
+fn truncate_middle(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let head_budget = cap / 2;
+    let tail_budget = cap - head_budget;
+    let head_end = floor_boundary(s, head_budget);
+    let tail_start = ceil_boundary(s, s.len() - tail_budget);
+    format!(
+        "{}\n[\u{2026} {} bytes omitted \u{2026}]\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
+    )
+}
+
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Defang tool-call delimiters in captured text.
+///
+/// Command output is untrusted: a file may contain something that looks like a
+/// tool call, and echoing it back verbatim would invite the model to treat it
+/// as one. Breaking the delimiter is enough to make it inert.
+pub fn sanitize_output(s: &str) -> String {
+    s.replace("\x3cshell", "\x3c shell")
+        .replace("\x3c/shell", "\x3c /shell")
 }
 
 // Tag delimiters, spelled with escapes so this source file does not itself
@@ -174,7 +276,11 @@ mod tests {
 
     #[test]
     fn multiple_commands_each_keep_their_timeout() {
-        let text = format!("{}\n{}", block("", "echo a"), block(r#" timeout="5""#, "echo b"));
+        let text = format!(
+            "{}\n{}",
+            block("", "echo a"),
+            block(r#" timeout="5""#, "echo b")
+        );
         let cmds = extract_shell_commands(&text);
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0].timeout, default_timeout());
@@ -194,6 +300,39 @@ mod tests {
         assert!(extract_shell_commands("\x3cshellfish>oops\x3c/shellfish\x3e").is_empty());
     }
 
+    #[test]
+    fn sanitizes_tool_call_tags_in_output() {
+        let text = format!("before {} after", block("", "rm -rf /"));
+        let clean = sanitize_output(&text);
+        assert!(!clean.contains(OPEN), "raw opening tag survived: {clean}");
+        assert!(!clean.contains(CLOSE), "raw closing tag survived: {clean}");
+        // Ordinary angle brackets are left alone.
+        assert_eq!(sanitize_output("a < b > c"), "a < b > c");
+    }
+
+    #[test]
+    fn short_output_is_not_truncated() {
+        assert_eq!(truncate_middle("hello", 256), "hello");
+    }
+
+    #[test]
+    fn long_output_keeps_head_and_tail() {
+        let s = "a".repeat(500) + &"b".repeat(500);
+        let out = truncate_middle(&s, 200);
+        assert!(out.len() < 400, "not truncated: {} bytes", out.len());
+        assert!(out.contains("bytes omitted"));
+        assert!(out.starts_with("aaa"));
+        assert!(out.ends_with("bbb"));
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // Multi-byte characters must never be split.
+        let s = "\u{e9}".repeat(400);
+        let out = truncate_middle(&s, 101);
+        assert!(out.contains("bytes omitted"));
+    }
+
     #[tokio::test]
     async fn run_shell_kills_on_timeout() {
         let start = std::time::Instant::now();
@@ -211,5 +350,23 @@ mod tests {
             .await
             .expect("run_shell ok");
         assert_eq!(out.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn run_shell_does_not_read_the_terminal() {
+        // With stdin at /dev/null, `read` hits EOF immediately instead of
+        // waiting for input.
+        let out = run_shell("read x; echo got:[$x]", Duration::from_secs(5))
+            .await
+            .expect("run_shell ok");
+        assert_eq!(out.trim(), "got:[]");
+    }
+
+    #[tokio::test]
+    async fn run_shell_reports_nonzero_exit() {
+        let out = run_shell("exit 3", Duration::from_secs(5))
+            .await
+            .expect("run_shell ok");
+        assert!(out.contains("exit status: 3"), "unexpected output: {out}");
     }
 }

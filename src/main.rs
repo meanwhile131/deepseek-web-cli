@@ -109,6 +109,50 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Command-line options.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Args {
+    /// Run model-proposed shell commands without asking for confirmation.
+    auto_approve: bool,
+    /// Print usage and exit.
+    help: bool,
+}
+
+/// Parse process arguments (excluding the program name).
+///
+/// Kept deliberately small and dependency-free: the CLI only has a couple of
+/// flags.  Unknown arguments are collected so the caller can report them
+/// rather than silently ignoring a typo such as `--auto-aprove`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedArgs {
+    args: Args,
+    unknown: Vec<String>,
+}
+
+fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> ParsedArgs {
+    let mut parsed = ParsedArgs::default();
+    for a in argv {
+        match a.as_str() {
+            "-y" | "--auto-approve" => parsed.args.auto_approve = true,
+            "-h" | "--help" => parsed.args.help = true,
+            other => parsed.unknown.push(other.to_string()),
+        }
+    }
+    parsed
+}
+
+/// Help text shown for `--help` and on argument errors.
+fn usage() -> &'static str {
+    "Usage: deepseek [OPTIONS]\n\
+     \n\
+     Options:\n\
+     \x20 -y, --auto-approve   run model-proposed shell commands without asking\n\
+     \x20 -h, --help           show this help and exit\n\
+     \n\
+     Credentials and tuning are read from the environment or the user-wide\n\
+     secrets file (see README)."
+}
+
 /// Path to the user-wide secrets file.
 ///
 /// Lookup order:
@@ -182,12 +226,12 @@ fn load_user_secrets() -> Option<PathBuf> {
 
 /// Fetch a required secret, failing with a message that points at both the
 /// environment and the user-wide secrets file.
-fn require_secret(name: &str, hint: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| {
+fn require_secret(name: &str, hint: &str) -> Result<String> {
+    std::env::var(name).map_err(|_| {
         let where_ = user_secrets_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "~/.config/deepseek-web-cli/.env".to_string());
-        panic!("set {name} ({hint}) in the environment or in {where_}")
+        anyhow::anyhow!("set {name} ({hint}) in the environment or in {where_}")
     })
 }
 
@@ -409,18 +453,27 @@ async fn stream_reply(
 /// Send `message`, then keep extracting and running shell commands until the
 /// model stops asking for them.  Returns `true` if the model signalled the
 /// active goal was completed at any point during the turn.
-async fn run_turn(
-    client: &mut api::DeepSeekClient,
-    rl: &mut DefaultEditor,
-    message: &str,
+/// Turn-wide settings, bundled so `run_turn` does not take a long argument
+/// list of booleans (which are easy to mix up at the call site).
+struct TurnConfig<'a> {
     thinking: bool,
     search: bool,
     auto_approve: bool,
     debug_pending: bool,
-    goal: &Option<String>,
+    goal: &'a Option<String>,
+}
+
+async fn run_turn(
+    client: &mut api::DeepSeekClient,
+    rl: &mut DefaultEditor,
+    message: &str,
+    cfg: &TurnConfig<'_>,
     interrupt: &Interrupt,
 ) -> Result<TurnResult> {
     let mut rx = interrupt.subscribe();
+    let (thinking, search) = (cfg.thinking, cfg.search);
+    let (auto_approve, debug_pending) = (cfg.auto_approve, cfg.debug_pending);
+    let goal = cfg.goal;
 
     let (mut pending, mut reasoning) = tokio::select! {
         r = stream_reply(client, message, thinking, search) => r?,
@@ -748,6 +801,22 @@ async fn apply_pending_title(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let parsed = parse_args(std::env::args().skip(1));
+    if parsed.args.help {
+        println!("{}", usage());
+        return Ok(());
+    }
+    if !parsed.unknown.is_empty() {
+        eprintln!(
+            "{} unknown argument(s): {}",
+            paint("1;33", "[warn]"),
+            parsed.unknown.join(" ")
+        );
+        eprintln!("{}", usage());
+        std::process::exit(2);
+    }
+    let args = parsed.args;
+
     // Pick up secrets from the user-wide file before anything reads them.
     let secrets_path = load_user_secrets();
     if env_flag("DS_DEBUG_SECRETS", false) {
@@ -757,12 +826,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    let session_id = require_secret("DS_SESSION_ID", "ds_session_id cookie");
-    let bearer = require_secret("AUTHORIZATION_TOKEN", "full 'Bearer ...' value");
+    let session_id = require_secret("DS_SESSION_ID", "ds_session_id cookie")?;
+    let bearer = require_secret("AUTHORIZATION_TOKEN", "full 'Bearer ...' value")?;
 
     let debug_pending = env_flag("DS_DEBUG_PENDING", false);
-    // Default OFF: executing model-authored commands without confirmation is opt-in.
-    let auto_approve = env_flag("DS_AUTO_APPROVE", true);
+    // Default OFF: executing model-authored commands without confirmation is
+    // opt-in via the `--auto-approve` / `-y` command-line flag.
+    let auto_approve = args.auto_approve;
     let thinking = env_flag("DS_THINKING", true);
     let search = env_flag("DS_SEARCH", true);
 
@@ -781,6 +851,10 @@ async fn main() -> Result<()> {
         );
     }
     client.set_policy(policy);
+    client.set_http_timeout(std::time::Duration::from_millis(env_u64(
+        "DS_HTTP_TIMEOUT_MS",
+        180_000,
+    )));
 
     // The system prompt is prepended to the first user message of each
     // conversation instead of being sent as a separate startup message.
@@ -824,6 +898,9 @@ async fn main() -> Result<()> {
     println!();
 
     loop {
+        // Give the client a fresh view of the interrupt channel so retry
+        // backoffs and session calls can be cancelled with Ctrl+C too.
+        client.set_cancel(interrupt.subscribe());
         let prompt = paint("1;35", ">> ");
         let line = rl.readline(&prompt);
         match line {
@@ -998,15 +1075,18 @@ async fn main() -> Result<()> {
                                 format!("{SYSTEM_PROMPT}\n\n{base}")
                             };
                             let message = with_goal(&goal, &base);
-                            let completed = match run_turn(
-                                &mut client,
-                                &mut rl,
-                                &message,
+                            let cfg = TurnConfig {
                                 thinking,
                                 search,
                                 auto_approve,
                                 debug_pending,
-                                &goal,
+                                goal: &goal,
+                            };
+                            let completed = match run_turn(
+                                &mut client,
+                                &mut rl,
+                                &message,
+                                &cfg,
                                 &interrupt,
                             )
                             .await
@@ -1050,19 +1130,14 @@ async fn main() -> Result<()> {
                     format!("{SYSTEM_PROMPT}\n\n{input}")
                 };
                 let message = with_goal(&goal, &message);
-                match run_turn(
-                    &mut client,
-                    &mut rl,
-                    &message,
+                let cfg = TurnConfig {
                     thinking,
                     search,
                     auto_approve,
                     debug_pending,
-                    &goal,
-                    &interrupt,
-                )
-                .await
-                {
+                    goal: &goal,
+                };
+                match run_turn(&mut client, &mut rl, &message, &cfg, &interrupt).await {
                     Ok(TurnResult::Done { completed }) => {
                         apply_pending_title(&client, &mut label, &mut pending_title).await;
                         if completed && goal.is_some() {
@@ -1095,7 +1170,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        goal_completed, parse_goal_command, parse_secrets, with_goal, GoalCommand, SessionCache,
+        goal_completed, parse_args, parse_goal_command, parse_secrets, with_goal, GoalCommand,
+        ParsedArgs, SessionCache,
     };
     use crate::sessions;
 
@@ -1198,6 +1274,45 @@ mod tests {
         // A page that only echoes the cursor row means paging stalled.
         assert_eq!(c.merge_page(vec![entry("a", 3.0)], true), 0);
         assert!(!c.has_more);
+    }
+
+    fn parse(v: &[&str]) -> ParsedArgs {
+        parse_args(v.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn auto_approve_is_off_by_default() {
+        let p = parse(&[]);
+        assert!(!p.args.auto_approve);
+        assert!(!p.args.help);
+        assert!(p.unknown.is_empty());
+    }
+
+    #[test]
+    fn accepts_long_and_short_auto_approve() {
+        assert!(parse(&["--auto-approve"]).args.auto_approve);
+        assert!(parse(&["-y"]).args.auto_approve);
+    }
+
+    #[test]
+    fn accepts_help_flag() {
+        assert!(parse(&["--help"]).args.help);
+        assert!(parse(&["-h"]).args.help);
+    }
+
+    #[test]
+    fn collects_unknown_arguments_instead_of_ignoring_them() {
+        let p = parse(&["--auto-aprove", "extra"]);
+        assert!(!p.args.auto_approve);
+        assert_eq!(p.unknown, vec!["--auto-aprove", "extra"]);
+    }
+
+    #[test]
+    fn flags_can_be_combined() {
+        let p = parse(&["-y", "--help"]);
+        assert!(p.args.auto_approve);
+        assert!(p.args.help);
+        assert!(p.unknown.is_empty());
     }
 
     #[test]
