@@ -1,2 +1,5 @@
 /target
 .env
+
+# HAR captures contain bearer tokens and session cookies
+*.har

@@ -118,8 +118,12 @@ fn backoff(attempt: u32, base: Duration, cap: Duration) -> Duration {
 fn message_mentions_rate_limit(s: &str) -> bool {
     let h = s.to_ascii_lowercase();
     h.contains("rate limit")
+        || h.contains("rate_limit")
+        || h.contains("rate-limit")
         || h.contains("ratelimit")
+        || h.contains("rate_limit_reached")
         || h.contains("too many requests")
+        || h.contains("too frequent")
         || h.contains("throttl")
         || h.contains("429")
 }
@@ -163,6 +167,21 @@ fn envelope_rate_limited(v: &Value) -> bool {
 
 /// Detect throttling in a single SSE event (or bare JSON line).
 fn event_rate_limited(evt: &Value) -> bool {
+    // `event: toast` carries the throttle reason in `finish_reason` and/or
+    // `content`, e.g.
+    //   {"type":"error","content":"Messages too frequent. Try again later.",
+    //    "finish_reason":"rate_limit_reached"}
+    // It has none of the envelope keys below, so check it explicitly.
+    if let Some(fr) = evt.get("finish_reason").and_then(|v| v.as_str()) {
+        if message_mentions_rate_limit(fr) {
+            return true;
+        }
+    }
+    if let Some(content) = evt.get("content").and_then(|v| v.as_str()) {
+        if message_mentions_rate_limit(content) {
+            return true;
+        }
+    }
     if let Some(err) = evt.get("error").filter(|e| !e.is_null()) {
         if is_rate_limit_code(err) || message_mentions_rate_limit(&err.to_string()) {
             return true;
@@ -1099,6 +1118,37 @@ mod tests {
             "p": "response/content",
             "v": "hello"
         });
+        assert!(!event_rate_limited(&evt));
+    }
+
+    #[test]
+    fn detects_har_toast_event() {
+        // Captured verbatim from a real chat/continue response (200 OK):
+        //   event: toast
+        //   data: {"type":"error","content":"Messages too frequent. Try again later.","finish_reason":"rate_limit_reached"}
+        let evt: Value = serde_json::json!({
+            "type": "error",
+            "content": "Messages too frequent. Try again later.",
+            "finish_reason": "rate_limit_reached"
+        });
+        assert!(event_rate_limited(&evt));
+    }
+
+    #[test]
+    fn detects_rate_limit_finish_reason_alone() {
+        let evt: Value = serde_json::json!({ "finish_reason": "rate_limit_reached" });
+        assert!(event_rate_limited(&evt));
+    }
+
+    #[test]
+    fn normal_toast_content_not_flagged() {
+        let evt: Value = serde_json::json!({ "type": "info", "content": "Copy link" });
+        assert!(!event_rate_limited(&evt));
+    }
+
+    #[test]
+    fn har_close_event_not_flagged() {
+        let evt: Value = serde_json::json!({ "click_behavior": "none", "auto_resume": false });
         assert!(!event_rate_limited(&evt));
     }
 
