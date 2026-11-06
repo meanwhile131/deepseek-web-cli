@@ -14,6 +14,14 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Home directory, honoring `HOME` on unix and `USERPROFILE` on Windows.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(PathBuf::from)
+}
+
 /// Path to the goal store.
 ///
 /// Lookup order:
@@ -35,9 +43,8 @@ fn store_path() -> Option<PathBuf> {
             );
         }
     }
-    std::env::var_os("HOME").map(|h| {
-        PathBuf::from(h)
-            .join(".local")
+    home_dir().map(|h| {
+        h.join(".local")
             .join("share")
             .join("deepseek-web-cli")
             .join("goals.json")

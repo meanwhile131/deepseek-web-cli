@@ -62,20 +62,38 @@ impl Interrupt {
     }
 }
 
-/// Install the SIGINT handler that feeds `interrupt`.
+/// Install the Ctrl+C (SIGINT) handler that feeds `interrupt`.
 fn spawn_sigint_handler(interrupt: &Interrupt) {
     let intr = interrupt.clone();
     tokio::spawn(async move {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-            Ok(mut sig) => {
-                while sig.recv().await.is_some() {
-                    intr.fire();
+        #[cfg(unix)]
+        {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(mut sig) => {
+                    while sig.recv().await.is_some() {
+                        intr.fire();
+                    }
+                }
+                Err(e) => eprintln!(
+                    "{} could not install Ctrl+C handler: {e}",
+                    paint("1;33", "[warn]")
+                ),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            loop {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => intr.fire(),
+                    Err(e) => {
+                        eprintln!(
+                            "{} could not install Ctrl+C handler: {e}",
+                            paint("1;33", "[warn]")
+                        );
+                        break;
+                    }
                 }
             }
-            Err(e) => eprintln!(
-                "{} could not install Ctrl+C handler: {e}",
-                paint("1;33", "[warn]")
-            ),
         }
     });
 }
@@ -153,6 +171,14 @@ fn usage() -> &'static str {
      secrets file (see README)."
 }
 
+/// Home directory, honoring `HOME` on unix and `USERPROFILE` on Windows.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(PathBuf::from)
+}
+
 /// Path to the user-wide secrets file.
 ///
 /// Lookup order:
@@ -170,12 +196,7 @@ fn user_secrets_path() -> Option<PathBuf> {
             return Some(PathBuf::from(dir).join("deepseek-web-cli").join(".env"));
         }
     }
-    std::env::var_os("HOME").map(|h| {
-        PathBuf::from(h)
-            .join(".config")
-            .join("deepseek-web-cli")
-            .join(".env")
-    })
+    home_dir().map(|h| h.join(".config").join("deepseek-web-cli").join(".env"))
 }
 
 /// Parse the contents of a secrets file: one `KEY=VALUE` per line.  Blank

@@ -63,10 +63,19 @@ pub struct ShellCommand {
 /// about it as ordinary output. Output is truncated to `max_output_bytes()`
 /// per stream and stripped of anything that looks like a tool-call tag.
 pub async fn run_shell(cmd: &str, timeout: Duration) -> Result<String> {
-    let mut command = Command::new("sh");
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
     command
-        .arg("-c")
-        .arg(cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
