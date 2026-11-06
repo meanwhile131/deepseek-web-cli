@@ -661,6 +661,12 @@ impl SessionCache {
     /// Returns how many new entries were added. Because `lte_cursor` is
     /// inclusive the page repeats its cursor row, so a page that adds nothing
     /// means paging has stalled; `has_more` is cleared in that case.
+    ///
+    /// After merging, the list is sorted newest-first by `updated_at`, so a
+    /// server that returns pages (or rows inside a page) in a different order
+    /// still yields a "latest first" listing. Sorting descending also keeps
+    /// the cursor sane: `fetch_next` pages from `entries.last()`, which is the
+    /// oldest row loaded so far.
     fn merge_page(&mut self, page: Vec<sessions::SessionEntry>, has_more: bool) -> usize {
         let before = self.entries.len();
         for e in page {
@@ -669,6 +675,13 @@ impl SessionCache {
             }
         }
         let added = self.entries.len() - before;
+        self.entries.sort_by(|a, b| {
+            b.updated_at
+                .partial_cmp(&a.updated_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Stable tie-break so paging and numbering are deterministic.
+                .then_with(|| b.id.cmp(&a.id))
+        });
         self.has_more = has_more && added > 0;
         added
     }
@@ -1295,6 +1308,34 @@ mod tests {
         // A page that only echoes the cursor row means paging stalled.
         assert_eq!(c.merge_page(vec![entry("a", 3.0)], true), 0);
         assert!(!c.has_more);
+    }
+
+    #[test]
+    fn merge_orders_latest_first() {
+        let mut c = SessionCache::default();
+        // Server returns rows out of order; the cache must normalise them.
+        c.merge_page(
+            vec![entry("old", 1.0), entry("new", 3.0), entry("mid", 2.0)],
+            false,
+        );
+        assert_eq!(
+            c.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["new", "mid", "old"]
+        );
+    }
+
+    #[test]
+    fn merge_keeps_latest_first_across_pages() {
+        let mut c = SessionCache::default();
+        c.merge_page(vec![entry("a", 3.0), entry("b", 2.0)], true);
+        // An older page arrives late and is not in order either.
+        c.merge_page(vec![entry("d", 1.0), entry("c", 1.5)], false);
+        assert_eq!(
+            c.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
+        // The cursor for the next page is the oldest row loaded.
+        assert_eq!(c.entries.last().unwrap().id, "d");
     }
 
     fn parse(v: &[&str]) -> ParsedArgs {
