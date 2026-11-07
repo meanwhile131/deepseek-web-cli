@@ -5,6 +5,7 @@
 //! the model.
 
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -55,6 +56,156 @@ pub struct ShellCommand {
     pub timeout: Duration,
 }
 
+/// How strongly a command is confined to the sandbox root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confinement {
+    /// Not sandboxed at all (`--unsandboxed`).
+    None,
+    /// Confined by an OS sandbox (bubblewrap on Linux, `sandbox-exec` on macOS):
+    /// the rest of the filesystem is read-only and writes outside the root fail.
+    Os,
+    /// Best effort only: the working directory and `HOME` are redirected into
+    /// the root, but nothing stops an absolute path from being read or written.
+    /// Used when no OS sandbox helper is installed.
+    WorkingDir,
+}
+
+impl Confinement {
+    /// Short human-readable label for the notice printed before each command.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Confinement::None => "unsandboxed",
+            Confinement::Os => "sandboxed",
+            Confinement::WorkingDir => "sandboxed (working dir only)",
+        }
+    }
+}
+
+/// Decide how `cmd` can be confined to `root` on this machine.
+fn confinement_for(root: &Path) -> Confinement {
+    let _ = root;
+    if os_sandbox_available() {
+        Confinement::Os
+    } else {
+        Confinement::WorkingDir
+    }
+}
+
+/// Label describing how a command will be confined: `"sandboxed"` when an OS
+/// sandbox is in force, `"sandboxed (working dir only)"` when only the working
+/// directory is redirected, and `"unsandboxed"` when `root` is `None`.
+pub fn sandbox_label(root: Option<&Path>) -> &'static str {
+    match root {
+        None => Confinement::None.label(),
+        Some(r) => confinement_for(r).label(),
+    }
+}
+
+/// Whether `root` will be confined by an OS sandbox rather than merely by
+/// redirecting the working directory. Callers use this to warn the user.
+pub fn os_sandbox_available() -> bool {
+    (cfg!(target_os = "linux") && which("bwrap").is_some())
+        || (cfg!(target_os = "macos") && which("sandbox-exec").is_some())
+}
+
+/// Look `name` up on `PATH`, returning its path when it is an executable file.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Build the process that will run `cmd`, confined to `sandbox_root` when set.
+fn build_command(cmd: &str, sandbox_root: Option<&Path>) -> (Command, Confinement) {
+    let Some(root) = sandbox_root else {
+        return (plain_shell(cmd), Confinement::None);
+    };
+    let level = confinement_for(root);
+    let mut c = match level {
+        Confinement::Os if cfg!(target_os = "linux") => bwrap_shell(cmd, root),
+        Confinement::Os if cfg!(target_os = "macos") => sandbox_exec_shell(cmd, root),
+        // WorkingDir, or an OS branch that was compiled out.
+        _ => plain_shell(cmd),
+    };
+    // In every sandboxed mode the command starts in the root and treats it as
+    // home, so relative paths and `~` land inside the sandbox.
+    c.current_dir(root)
+        .env("HOME", root)
+        .env("TMPDIR", root)
+        .env("PWD", root);
+    (c, level)
+}
+
+/// A bare `sh -c` (or `cmd /C` on Windows) with no confinement.
+fn plain_shell(cmd: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    }
+}
+
+/// bubblewrap: everything read-only, the sandbox root writable, `/dev` and
+/// `/proc` provided so ordinary tools keep working.
+#[cfg(target_os = "linux")]
+fn bwrap_shell(cmd: &str, root: &Path) -> Command {
+    let mut c = Command::new("bwrap");
+    c.arg("--die-with-parent")
+        .arg("--ro-bind")
+        .arg("/")
+        .arg("/")
+        .arg("--dev")
+        .arg("/dev")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--bind")
+        .arg(root)
+        .arg(root)
+        .arg("--chdir")
+        .arg(root)
+        .arg("sh")
+        .arg("-c")
+        .arg(cmd);
+    c
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bwrap_shell(cmd: &str, _root: &Path) -> Command {
+    plain_shell(cmd)
+}
+
+/// macOS `sandbox-exec`: deny all writes except under the root and the usual
+/// scratch directories.
+#[cfg(target_os = "macos")]
+fn sandbox_exec_shell(cmd: &str, root: &Path) -> Command {
+    let profile = format!(
+        "(version 1)\n(allow default)\n(deny file-write*)\n\
+         (allow file-write* (subpath \"{root}\") (subpath \"/tmp\") \
+         (subpath \"/private/tmp\") (subpath \"/dev\") (literal \"/dev/null\"))\n",
+        root = root.display()
+    );
+    let mut c = Command::new("sandbox-exec");
+    c.arg("-p").arg(profile).arg("sh").arg("-c").arg(cmd);
+    c
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sandbox_exec_shell(cmd: &str, _root: &Path) -> Command {
+    plain_shell(cmd)
+}
+
 /// Run `cmd` under `sh -c`, killing it if it exceeds `timeout`.
 ///
 /// stdin is `/dev/null` so an interactive command cannot fight the line editor
@@ -62,19 +213,17 @@ pub struct ShellCommand {
 /// so backgrounded grandchildren do not outlive the turn; the model is told
 /// about it as ordinary output. Output is truncated to `max_output_bytes()`
 /// per stream.
-pub async fn run_shell(cmd: &str, timeout: Duration) -> Result<String> {
-    #[cfg(windows)]
-    let mut command = {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut command = {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd);
-        c
-    };
+///
+/// When `sandbox_root` is `Some`, the command runs with that directory as its
+/// working directory and `HOME`, and - where an OS sandbox helper is
+/// available - with the rest of the filesystem read-only. Passing `None` runs
+/// the command unconfined.
+pub async fn run_shell(
+    cmd: &str,
+    timeout: Duration,
+    sandbox_root: Option<&Path>,
+) -> Result<String> {
+    let (mut command, _level) = build_command(cmd, sandbox_root);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -328,7 +477,7 @@ mod tests {
     #[tokio::test]
     async fn run_shell_kills_on_timeout() {
         let start = std::time::Instant::now();
-        let out = run_shell("sleep 10", Duration::from_millis(200))
+        let out = run_shell("sleep 10", Duration::from_millis(200), None)
             .await
             .expect("run_shell should not error on timeout");
         assert!(out.contains("timed out"), "unexpected output: {out}");
@@ -343,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_shell_returns_output_when_fast() {
-        let out = run_shell("echo hello", Duration::from_secs(5))
+        let out = run_shell("echo hello", Duration::from_secs(5), None)
             .await
             .expect("run_shell ok");
         assert_eq!(out.trim(), "hello");
@@ -353,7 +502,7 @@ mod tests {
     async fn run_shell_does_not_read_the_terminal() {
         // With stdin at /dev/null, `read` hits EOF immediately instead of
         // waiting for input.
-        let out = run_shell("read x; echo got:[$x]", Duration::from_secs(5))
+        let out = run_shell("read x; echo got:[$x]", Duration::from_secs(5), None)
             .await
             .expect("run_shell ok");
         assert_eq!(out.trim(), "got:[]");
@@ -361,9 +510,52 @@ mod tests {
 
     #[tokio::test]
     async fn run_shell_reports_nonzero_exit() {
-        let out = run_shell("exit 3", Duration::from_secs(5))
+        let out = run_shell("exit 3", Duration::from_secs(5), None)
             .await
             .expect("run_shell ok");
         assert!(out.contains("exit status: 3"), "unexpected output: {out}");
+    }
+
+    #[tokio::test]
+    async fn sandboxed_command_runs_in_the_root() {
+        let root = std::env::temp_dir().join(format!("ds-sandbox-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // `pwd` must report the sandbox root, and a relative write must land
+        // there rather than in the test runner's cwd.
+        let out = run_shell(
+            "pwd; echo hi > rel.txt",
+            Duration::from_secs(10),
+            Some(&root),
+        )
+        .await
+        .expect("run_shell ok");
+        let canon_root = root.canonicalize().unwrap();
+        assert!(
+            out.contains(&canon_root.display().to_string())
+                || out.contains(&root.display().to_string()),
+            "pwd did not report the sandbox root: {out}"
+        );
+        assert!(
+            root.join("rel.txt").exists(),
+            "relative write escaped the root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn sandbox_sets_home_inside_the_root() {
+        let root = std::env::temp_dir().join(format!("ds-home-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let out = run_shell("echo $HOME", Duration::from_secs(10), Some(&root))
+            .await
+            .expect("run_shell ok");
+        assert_eq!(out.trim(), root.display().to_string());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn confinement_label_is_set() {
+        assert_eq!(Confinement::None.label(), "unsandboxed");
+        assert!(Confinement::Os.label().starts_with("sandboxed"));
     }
 }

@@ -18,7 +18,8 @@ use tokio::sync::watch;
 const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with access to a local shell.
 To run commands, emit blocks in exactly this form (never inside private reasoning, never in markdown fences):
 <shell>command goes here</shell>
-Each block runs one command; batch several into a single reply. The user executes them and replies with [SHELL OUTPUT] followed by the result."#;
+Each block runs one command; batch several into a single reply. Blocks are executed automatically and the result is sent back to you as [SHELL OUTPUT].
+By default commands are confined to the current working directory: that is their working directory and their HOME. Where the OS provides a sandbox (bubblewrap on Linux, sandbox-exec on macOS) the rest of the filesystem is read-only, so do not try to write outside it. Respect that boundary."#;
 
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";
@@ -127,8 +128,9 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// Command-line options.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Args {
-    /// Run model-proposed shell commands without asking for confirmation.
-    auto_approve: bool,
+    /// Disable the current-directory sandbox and give commands full,
+    /// unsandboxed filesystem access.
+    unsandboxed: bool,
     /// Sign in through the browser even if a saved token exists.
     login: bool,
     /// Do not launch a browser during login; just print the URL.
@@ -152,7 +154,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> ParsedArgs {
     let mut parsed = ParsedArgs::default();
     for a in argv {
         match a.as_str() {
-            "-y" | "--auto-approve" => parsed.args.auto_approve = true,
+            "-u" | "--unsandboxed" | "--no-sandbox" => parsed.args.unsandboxed = true,
             "--login" => parsed.args.login = true,
             "--no-browser" => parsed.args.no_browser = true,
             "-h" | "--help" => parsed.args.help = true,
@@ -167,11 +169,14 @@ fn usage() -> &'static str {
     "Usage: deepseek [OPTIONS]\n\
      \n\
      Options:\n\
-     \x20 -y, --auto-approve   run model-proposed shell commands without asking\n\
+     \x20 -u, --unsandboxed    give shell commands full, unsandboxed filesystem\n\
+     \x20                      access (default: sandboxed to the current dir)\n\
      \x20     --login          sign in through the browser even if a token exists\n\
      \x20     --no-browser     during login, print the URL instead of opening it\n\
      \x20 -h, --help           show this help and exit\n\
      \n\
+     Model-proposed shell commands run without asking, in a sandbox rooted at\n\
+     the directory the CLI was started from. Pass --unsandboxed to lift that.\n\
      With no saved credentials the tool opens chat.deepseek.com in your browser\n\
      and picks up the token once you have signed in - nothing to copy or paste.\n\
      Other settings are read from the environment or the user-wide secrets file\n\
@@ -597,21 +602,22 @@ async fn stream_reply(
 struct TurnConfig<'a> {
     thinking: bool,
     search: bool,
-    auto_approve: bool,
+    /// `Some(root)` runs commands sandboxed to `root`; `None` is unsandboxed.
+    sandbox_root: Option<std::path::PathBuf>,
     debug_pending: bool,
     goal: &'a Option<String>,
 }
 
 async fn run_turn(
     client: &mut api::DeepSeekClient,
-    rl: &mut DefaultEditor,
     message: &str,
     cfg: &TurnConfig<'_>,
     interrupt: &Interrupt,
 ) -> Result<TurnResult> {
     let mut rx = interrupt.subscribe();
     let (thinking, search) = (cfg.thinking, cfg.search);
-    let (auto_approve, debug_pending) = (cfg.auto_approve, cfg.debug_pending);
+    let sandbox_root = cfg.sandbox_root.as_deref();
+    let debug_pending = cfg.debug_pending;
     let goal = cfg.goal;
 
     let (mut pending, mut reasoning) = tokio::select! {
@@ -673,27 +679,15 @@ async fn run_turn(
             let cmd_text = cmd.cmd.clone();
             let cmd_timeout = cmd.timeout;
             println!("\n{} {}", paint("1;35", "[shell]"), paint("35", &cmd_text));
-            if auto_approve {
-                println!("{}", paint("2", "execute? [auto-approved]"));
-            } else {
-                // Use the rustyline editor so we never read raw
-                // stdin behind its back.
-                let approve_prompt = format!("{} ", paint("33", "execute? [y/N]"));
-                let approved = match rl.readline(&approve_prompt) {
-                    Ok(a) => a.trim().eq_ignore_ascii_case("y"),
-                    Err(ReadlineError::Interrupted) => {
-                        println!("\n{}", paint("1;33", "[interrupted]"));
-                        return Ok(TurnResult::Interrupted);
-                    }
-                    Err(_) => false,
-                };
-                if !approved {
-                    println!("{}", paint("2", "skipped"));
-                    continue;
-                }
+            // Commands are auto-approved by default; the sandbox, not a
+            // confirmation prompt, is what bounds what they may touch.
+            let label = shell::sandbox_label(sandbox_root);
+            match sandbox_root {
+                Some(root) => println!("{}", paint("2", &format!("[{label}: {}]", root.display()))),
+                None => println!("{}", paint("1;33", &format!("[{label}]"))),
             }
             let output = match tokio::select! {
-                r = shell::run_shell(&cmd_text, cmd_timeout) => r,
+                r = shell::run_shell(&cmd_text, cmd_timeout, sandbox_root) => r,
                 _ = rx.changed() => {
                     println!("\n{}", paint("1;33", "[interrupted]"));
                     return Ok(TurnResult::Interrupted);
@@ -1001,9 +995,22 @@ async fn main() -> Result<()> {
         .filter(|v| !v.is_empty());
 
     let debug_pending = env_flag("DS_DEBUG_PENDING", false);
-    // Default OFF: executing model-authored commands without confirmation is
-    // opt-in via the `--auto-approve` / `-y` command-line flag.
-    let auto_approve = args.auto_approve;
+    // Commands are auto-approved. Unless `--unsandboxed` is given they run
+    // sandboxed to the directory the CLI was started from.
+    let sandbox_root = if args.unsandboxed {
+        None
+    } else {
+        let root = std::env::current_dir().context("could not determine the current directory")?;
+        if !shell::os_sandbox_available() {
+            eprintln!(
+                "{} no OS sandbox helper (bubblewrap on Linux, sandbox-exec on macOS) found; \
+                 commands run with the current directory as their working directory and HOME, \
+                 but absolute paths are not confined. Use --unsandboxed to silence this.",
+                paint("1;33", "[warn]")
+            );
+        }
+        Some(root)
+    };
     let thinking = env_flag("DS_THINKING", true);
     let search = env_flag("DS_SEARCH", true);
 
@@ -1359,18 +1366,12 @@ async fn main() -> Result<()> {
                             let cfg = TurnConfig {
                                 thinking,
                                 search,
-                                auto_approve,
+                                sandbox_root: sandbox_root.clone(),
                                 debug_pending,
                                 goal: &goal,
                             };
-                            let completed = match run_turn(
-                                &mut client,
-                                &mut rl,
-                                &message,
-                                &cfg,
-                                &interrupt,
-                            )
-                            .await
+                            let completed = match run_turn(&mut client, &message, &cfg, &interrupt)
+                                .await
                             {
                                 Ok(TurnResult::Done { completed }) => completed,
                                 Ok(TurnResult::Interrupted) => {
@@ -1414,11 +1415,11 @@ async fn main() -> Result<()> {
                 let cfg = TurnConfig {
                     thinking,
                     search,
-                    auto_approve,
+                    sandbox_root: sandbox_root.clone(),
                     debug_pending,
                     goal: &goal,
                 };
-                match run_turn(&mut client, &mut rl, &message, &cfg, &interrupt).await {
+                match run_turn(&mut client, &message, &cfg, &interrupt).await {
                     Ok(TurnResult::Done { completed }) => {
                         apply_pending_title(&client, &mut label, &mut pending_title).await;
                         if completed && goal.is_some() {
@@ -1590,17 +1591,18 @@ mod tests {
     }
 
     #[test]
-    fn auto_approve_is_off_by_default() {
+    fn sandbox_is_on_by_default() {
         let p = parse(&[]);
-        assert!(!p.args.auto_approve);
+        assert!(!p.args.unsandboxed);
         assert!(!p.args.help);
         assert!(p.unknown.is_empty());
     }
 
     #[test]
-    fn accepts_long_and_short_auto_approve() {
-        assert!(parse(&["--auto-approve"]).args.auto_approve);
-        assert!(parse(&["-y"]).args.auto_approve);
+    fn accepts_unsandboxed_flags() {
+        assert!(parse(&["--unsandboxed"]).args.unsandboxed);
+        assert!(parse(&["--no-sandbox"]).args.unsandboxed);
+        assert!(parse(&["-u"]).args.unsandboxed);
     }
 
     #[test]
@@ -1611,15 +1613,22 @@ mod tests {
 
     #[test]
     fn collects_unknown_arguments_instead_of_ignoring_them() {
-        let p = parse(&["--auto-aprove", "extra"]);
-        assert!(!p.args.auto_approve);
-        assert_eq!(p.unknown, vec!["--auto-aprove", "extra"]);
+        let p = parse(&["--unsandbaxed", "extra"]);
+        assert!(!p.args.unsandboxed);
+        assert_eq!(p.unknown, vec!["--unsandbaxed", "extra"]);
+    }
+
+    #[test]
+    fn auto_approve_flag_is_gone() {
+        // Auto-approval is the default now; the old opt-in flag is unknown.
+        let p = parse(&["--auto-approve"]);
+        assert_eq!(p.unknown, vec!["--auto-approve"]);
     }
 
     #[test]
     fn flags_can_be_combined() {
-        let p = parse(&["-y", "--help"]);
-        assert!(p.args.auto_approve);
+        let p = parse(&["-u", "--help"]);
+        assert!(p.args.unsandboxed);
         assert!(p.args.help);
         assert!(p.unknown.is_empty());
     }

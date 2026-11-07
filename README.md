@@ -2,7 +2,8 @@
 
 A terminal chat client for the DeepSeek web API. It keeps a conversation
 threaded server-side, streams replies (including the reasoning region), and can
-run shell commands the model proposes, with your approval by default.
+run shell commands the model proposes. Commands are executed automatically,
+inside a sandbox rooted at the directory the CLI was started in.
 
 ## Install
 
@@ -15,7 +16,7 @@ run shell commands the model proposes, with your approval by default.
 
 | Option | Effect |
 | --- | --- |
-| `-y`, `--auto-approve` | run model-proposed shell commands without asking (opt-in) |
+| `-u`, `--unsandboxed` | lift the sandbox: give shell commands full, unsandboxed filesystem access |
 | `--login` | sign in through the browser even if a token is already saved |
 | `--no-browser` | during sign-in, print the URL instead of opening a browser |
 | `-h`, `--help` | show help and exit |
@@ -117,6 +118,26 @@ The model asks to run a command with a tagged block:
 
     <shell>command</shell>
     <shell timeout="5m">long running command</shell>
+
+Commands are auto-approved: the model's `<shell>` blocks are executed as soon
+as they arrive, without a confirmation prompt. What bounds them is the
+**sandbox**, not an approval step.
+
+By default every command runs confined to the directory the CLI was started
+from:
+
+* the working directory, `PWD`, `HOME` and `TMPDIR` are all set to that
+  directory, so relative paths and `~` resolve inside it;
+* where an OS sandbox helper is installed the confinement is enforced rather
+  than merely conventional. On Linux, [bubblewrap](https://github.com/containers/bubblewrap)
+  (`bwrap`) is used: the whole filesystem is mounted read-only and only the
+  sandbox root is writable. On macOS, `sandbox-exec` denies writes outside the
+  root. If neither helper is present a warning is printed at startup and only
+  the working directory is redirected - an absolute path can still reach
+  outside, so install `bwrap` for real isolation.
+
+Pass `-u` / `--unsandboxed` (`--no-sandbox` also works) to turn this off and
+give commands full, unsandboxed access to the machine.
 
 Commands run under `sh -c` with stdin at `/dev/null`. On timeout the child and
 its whole process group are killed. Output is capped per stream (head and tail
