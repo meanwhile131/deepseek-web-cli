@@ -20,12 +20,19 @@ run shell commands the model proposes, with your approval by default.
 
 ## Credentials
 
-Two values are required:
-
 | Variable | Meaning |
 | --- | --- |
-| `DS_SESSION_ID` | the `ds_session_id` cookie from chat.deepseek.com |
-| `AUTHORIZATION_TOKEN` | the full `Bearer ...` value sent by the web app |
+| `AUTHORIZATION_TOKEN` | **required.** The full `Bearer ...` value sent by the web app |
+| `DS_SESSION_ID` | optional. The `ds_session_id` cookie from chat.deepseek.com |
+
+Only the bearer token is checked by the API. `DS_SESSION_ID` may be omitted
+(or left empty); when set it is sent as a cookie, when unset no `Cookie`
+header is sent at all. The tool keeps no cookie jar of its own, so it can never
+replay a cookie the user did not configure.
+
+At startup the token is verified against `users/current`. If it has been
+revoked or has expired the tool says so and points at the secrets file instead
+of failing on the first prompt.
 
 They are read from the environment first, then from a user-wide secrets file:
 

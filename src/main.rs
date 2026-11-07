@@ -860,8 +860,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    let session_id = require_secret("DS_SESSION_ID", "ds_session_id cookie")?;
     let bearer = require_secret("AUTHORIZATION_TOKEN", "full 'Bearer ...' value")?;
+    // Optional: only the bearer token is checked by the API (see
+    // `DeepSeekClient::new`).  Treat an empty value as absent so a `.env` line
+    // like `DS_SESSION_ID=` does not send a blank cookie.
+    let session_id = std::env::var("DS_SESSION_ID")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
 
     let debug_pending = env_flag("DS_DEBUG_PENDING", false);
     // Default OFF: executing model-authored commands without confirmation is
@@ -889,6 +895,38 @@ async fn main() -> Result<()> {
         "DS_HTTP_TIMEOUT_MS",
         180_000,
     )));
+
+    // Prove the token still works before starting the prompt loop.  If the
+    // session was revoked (e.g. "logged out elsewhere"), say so plainly and
+    // point at the credential, instead of surfacing a 40003 on the first turn.
+    match client.check_auth().await {
+        Ok(email) => {
+            if env_flag("DS_DEBUG_SECRETS", false) {
+                eprintln!("[auth] signed in as {email}");
+            }
+        }
+        Err(e) if api::is_auth_error(&format!("{e:#}")) => {
+            eprintln!(
+                "{} DeepSeek rejected the saved credentials: {e:#}",
+                paint("1;31", "[error]")
+            );
+            eprintln!(
+                "{} refresh AUTHORIZATION_TOKEN (and optionally DS_SESSION_ID) in {}",
+                paint("1;33", "[hint]"),
+                secrets_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.config/deepseek-web-cli/.env".to_string())
+            );
+            std::process::exit(1);
+        }
+        // Anything else (DNS hiccup, captive portal, ...) is not proof the
+        // token is bad; warn and let the turn-level retry logic deal with it.
+        Err(e) => eprintln!(
+            "{} could not verify credentials yet: {e:#}",
+            paint("1;33", "[warn]")
+        ),
+    }
 
     // The system prompt is prepended to the first user message of each
     // conversation instead of being sent as a separate startup message.

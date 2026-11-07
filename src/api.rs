@@ -22,6 +22,7 @@ const SESSION_PAGE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/fe
 const SESSION_TITLE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/update_title";
 const SESSION_DELETE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/delete";
 const HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
+const USER_URL: &str = "https://chat.deepseek.com/api/v0/users/current";
 
 // ---------------------------------------------------------------------------
 // Rate-limit / transient-failure policy
@@ -205,6 +206,59 @@ fn event_rate_limited(evt: &Value) -> bool {
     false
 }
 
+/// True when an envelope's top-level `code`/`msg` pair signals a failure.
+///
+/// The API answers `200 OK` with `{"code":40003,"msg":"INVALID_TOKEN"}` when a
+/// token is rejected and with `{"code":40002,"msg":"Missing Token"}` when none
+/// is sent, so a plain HTTP status check is not enough.
+fn envelope_error(v: &Value) -> Option<String> {
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+    let biz_code = v
+        .get("data")
+        .and_then(|d| d.get("biz_code"))
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
+    if code == 0 && biz_code == 0 {
+        return None;
+    }
+    let msg = v
+        .get("msg")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            v.get("data")
+                .and_then(|d| d.get("biz_msg"))
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+        })
+        .unwrap_or("no message");
+    let code = if code != 0 { code } else { biz_code };
+    Some(format!("{msg} (code {code})"))
+}
+
+/// True when an error string describes a rejected credential rather than a
+/// transient problem. The API reports these as `40002 Missing Token` and
+/// `40003 INVALID_TOKEN` / `Authorization Failed`.
+pub fn is_auth_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("code 40002")
+        || m.contains("code 40003")
+        || m.contains("missing token")
+        || m.contains("invalid_token")
+        || m.contains("invalid token")
+        || m.contains("authorization failed")
+}
+
+/// Unwrap `data.biz_data`, reporting an API-level error instead of quietly
+/// returning `null` (which used to surface as a confusing
+/// "returned no account data" / "no session id" message).
+fn unwrap_biz(v: Value, label: &str) -> Result<Value> {
+    if let Some(err) = envelope_error(&v) {
+        bail!("{label} failed: {err}");
+    }
+    Ok(v["data"]["biz_data"].clone())
+}
+
 /// Pull a server-suggested delay out of an event payload.
 fn retry_after_value(v: &Value) -> Option<Duration> {
     for k in ["retry_after", "retry-after", "retryAfter"] {
@@ -384,7 +438,7 @@ async fn get_json(
                 attempt += 1;
                 continue;
             }
-            return Ok(v["data"]["biz_data"].clone());
+            return unwrap_biz(v, label);
         }
 
         if !is_retryable(status) {
@@ -536,7 +590,10 @@ fn build_http(headers: header::HeaderMap, timeout: Option<Duration>) -> Result<C
     let timeout = timeout.unwrap_or(Duration::from_secs(180));
     Ok(Client::builder()
         .default_headers(headers)
-        .cookie_store(true)
+        // Deliberately no cookie jar: this tool must not accumulate or replay
+        // cookies of its own.  Everything it needs is in `headers` (the bearer
+        // token, plus `ds_session_id` only if the user configured one), so a
+        // request can never carry a cookie the user did not choose to send.
         .connect_timeout(timeout.min(Duration::from_secs(30)))
         .timeout(timeout)
         .user_agent(
@@ -560,12 +617,21 @@ pub struct DeepSeekClient {
 }
 
 impl DeepSeekClient {
-    pub fn new(session_id: String, bearer: String) -> Result<Self> {
+    pub fn new(session_id: Option<String>, bearer: String) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            format!("ds_session_id={}", session_id).parse()?,
-        );
+        // The Bearer token is the only credential the API actually checks: the
+        // web app authenticates with it alone, and the endpoints answer
+        // identically with no cookie, a stale cookie, or a bogus one.  The
+        // `ds_session_id` cookie is therefore optional.  Sending it only when
+        // the caller supplied a live value keeps a cookie copied from an old
+        // browser session from being presented as if it were still current.
+        if let Some(sid) = session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            headers.insert(header::COOKIE, format!("ds_session_id={sid}").parse()?);
+        }
         headers.insert(header::AUTHORIZATION, bearer.parse()?);
         let http = build_http(headers.clone(), None)?;
         Ok(Self {
@@ -577,6 +643,34 @@ impl DeepSeekClient {
             policy: RetryPolicy::default(),
             slot: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Verify the bearer token against `users/current`.
+    ///
+    /// Returns the account's (masked) email on success. Fails with the server's
+    /// own message when the token has been revoked or has expired, so a
+    /// logged-out session is reported at startup instead of as a confusing
+    /// error on the first prompt.
+    pub async fn check_auth(&self) -> Result<String> {
+        let mut cancel = self.cancel.clone();
+        let biz = get_json(
+            &self.http,
+            &self.policy,
+            &self.slot,
+            &mut cancel,
+            USER_URL,
+            &[],
+            "users/current",
+        )
+        .await?;
+        if biz.is_null() {
+            bail!("users/current returned no account data");
+        }
+        Ok(biz
+            .get("email")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>")
+            .to_string())
     }
 
     pub fn set_policy(&mut self, policy: RetryPolicy) {
@@ -1150,6 +1244,73 @@ mod tests {
     fn har_close_event_not_flagged() {
         let evt: Value = serde_json::json!({ "click_behavior": "none", "auto_resume": false });
         assert!(!event_rate_limited(&evt));
+    }
+
+    #[test]
+    fn envelope_error_detects_invalid_token() {
+        // Verbatim from a revoked/expired token: HTTP 200, code 40003.
+        let v: Value = serde_json::json!({
+            "code": 40003,
+            "msg": "Authorization Failed (invalid token)",
+            "data": null
+        });
+        let e = envelope_error(&v).expect("must be an error");
+        assert!(e.contains("Authorization Failed"), "{e}");
+        assert!(e.contains("40003"), "{e}");
+    }
+
+    #[test]
+    fn classifies_auth_errors() {
+        let expired = envelope_error(&serde_json::json!({
+            "code": 40003, "msg": "Authorization Failed (invalid token)", "data": null
+        }))
+        .unwrap();
+        assert!(is_auth_error(&expired), "{expired}");
+        let missing = envelope_error(&serde_json::json!({
+            "code": 40002, "msg": "Missing Token", "data": null
+        }))
+        .unwrap();
+        assert!(is_auth_error(&missing), "{missing}");
+        assert!(!is_auth_error("rate limited (code 429)"));
+        assert!(!is_auth_error(
+            "chat_session/create failed: network unreachable"
+        ));
+    }
+
+    #[test]
+    fn envelope_error_detects_missing_token() {
+        let v: Value = serde_json::json!({ "code": 40002, "msg": "Missing Token", "data": null });
+        assert!(envelope_error(&v).unwrap().contains("Missing Token"));
+    }
+
+    #[test]
+    fn envelope_error_detects_biz_code() {
+        let v: Value = serde_json::json!({
+            "code": 0,
+            "msg": "",
+            "data": { "biz_code": 1, "biz_msg": "illegal count", "biz_data": null }
+        });
+        let e = envelope_error(&v).unwrap();
+        assert!(e.contains("illegal count"), "{e}");
+    }
+
+    #[test]
+    fn envelope_error_ignores_success() {
+        let v: Value = serde_json::json!({
+            "code": 0,
+            "msg": "",
+            "data": { "biz_code": 0, "biz_msg": "", "biz_data": { "ok": true } }
+        });
+        assert!(envelope_error(&v).is_none());
+        assert_eq!(unwrap_biz(v, "x").unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn unwrap_biz_reports_api_errors_instead_of_null() {
+        let v: Value = serde_json::json!({ "code": 40003, "msg": "INVALID_TOKEN", "data": null });
+        let err = unwrap_biz(v, "users/current").unwrap_err().to_string();
+        assert!(err.starts_with("users/current failed:"), "{err}");
+        assert!(err.contains("INVALID_TOKEN"), "{err}");
     }
 
     #[test]
