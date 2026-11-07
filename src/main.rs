@@ -1,16 +1,17 @@
 mod api;
 mod color;
 mod goals;
+mod login;
 mod pow;
 mod sessions;
 mod shell;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use color::paint;
 use futures_util::StreamExt;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::sync::watch;
 
@@ -132,6 +133,10 @@ fn env_u64(name: &str, default: u64) -> u64 {
 struct Args {
     /// Run model-proposed shell commands without asking for confirmation.
     auto_approve: bool,
+    /// Sign in through the browser even if a saved token exists.
+    login: bool,
+    /// Do not launch a browser during login; just print the URL.
+    no_browser: bool,
     /// Print usage and exit.
     help: bool,
 }
@@ -152,6 +157,8 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> ParsedArgs {
     for a in argv {
         match a.as_str() {
             "-y" | "--auto-approve" => parsed.args.auto_approve = true,
+            "--login" => parsed.args.login = true,
+            "--no-browser" => parsed.args.no_browser = true,
             "-h" | "--help" => parsed.args.help = true,
             other => parsed.unknown.push(other.to_string()),
         }
@@ -165,10 +172,14 @@ fn usage() -> &'static str {
      \n\
      Options:\n\
      \x20 -y, --auto-approve   run model-proposed shell commands without asking\n\
+     \x20     --login          sign in through the browser even if a token exists\n\
+     \x20     --no-browser     during login, print the URL instead of opening it\n\
      \x20 -h, --help           show this help and exit\n\
      \n\
-     Credentials and tuning are read from the environment or the user-wide\n\
-     secrets file (see README)."
+     With no saved credentials the tool opens chat.deepseek.com in your browser\n\
+     and picks up the token once you have signed in - nothing to copy or paste.\n\
+     Other settings are read from the environment or the user-wide secrets file\n\
+     (see README)."
 }
 
 /// Home directory, honoring `HOME` on unix and `USERPROFILE` on Windows.
@@ -245,15 +256,126 @@ fn load_user_secrets() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Fetch a required secret, failing with a message that points at both the
-/// environment and the user-wide secrets file.
-fn require_secret(name: &str, hint: &str) -> Result<String> {
-    std::env::var(name).map_err(|_| {
-        let where_ = user_secrets_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "~/.config/deepseek-web-cli/.env".to_string());
-        anyhow::anyhow!("set {name} ({hint}) in the environment or in {where_}")
-    })
+/// Where a freshly harvested token is written when no override is set.
+fn secrets_path_or_default() -> PathBuf {
+    user_secrets_path().unwrap_or_else(|| PathBuf::from("~/.config/deepseek-web-cli/.env"))
+}
+
+/// How long to wait for the user to finish signing in.
+const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Sign in without asking the user to copy anything.
+///
+/// The user signs in to chat.deepseek.com in their own browser; the web app
+/// stores the bearer token in local storage, and this reads it from there.
+/// The token is then saved to the user-wide secrets file so later runs need no
+/// browser at all.
+fn interactive_login(no_browser: bool, rejected: &[String]) -> Result<String> {
+    let path = secrets_path_or_default();
+    let mut found = login::discover_token(rejected);
+
+    if found.is_some() {
+        // A previous browser sign-in is still on disk; reuse it silently.
+    } else {
+        println!();
+        println!("{}", paint("1;36", "Sign in to DeepSeek"));
+        println!(
+            "  {}",
+            paint(
+                "2",
+                "A browser window will open. Sign in however you normally do"
+            )
+        );
+        println!(
+            "  {}",
+            paint(
+                "2",
+                "(password, Google, phone) - there is nothing to copy or paste."
+            )
+        );
+        if !no_browser && !login::open_browser(login::LOGIN_URL) {
+            println!(
+                "{} could not launch a browser; open this URL manually:",
+                paint("1;33", "[warn]")
+            );
+        } else {
+            println!("  {}", paint("2", "If it did not open, visit:"));
+        }
+        println!("    {}", paint("34", login::LOGIN_URL));
+        println!();
+
+        let interactive = std::io::stdin().is_terminal();
+        let deadline = std::time::Instant::now() + LOGIN_TIMEOUT;
+        let mut last_note = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            if let Some(t) = login::discover_token(rejected) {
+                found = Some(t);
+                break;
+            }
+            if !interactive {
+                anyhow::bail!(
+                    "no DeepSeek token found in any browser profile (stdin is not a terminal, so\
+                     \x20not waiting); set AUTHORIZATION_TOKEN or rerun `deepseek --login` in a terminal"
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out after {}s waiting for a sign-in; set AUTHORIZATION_TOKEN or try again",
+                    LOGIN_TIMEOUT.as_secs()
+                );
+            }
+            if last_note.elapsed() >= std::time::Duration::from_secs(20) {
+                last_note = std::time::Instant::now();
+                println!(
+                    "{}",
+                    paint("2", "  still waiting for you to finish signing in...")
+                );
+            }
+        }
+    }
+
+    let found = found.ok_or_else(|| {
+        anyhow::anyhow!("could not read a DeepSeek token from any browser profile")
+    })?;
+    login::save_token(&path, &found.token).with_context(|| {
+        format!(
+            "signed in via {}, but could not save the token to {}",
+            found.source,
+            path.display()
+        )
+    })?;
+    println!(
+        "{} signed in via {}; token saved to {}",
+        paint("32", "[login]"),
+        found.source,
+        path.display()
+    );
+    Ok(found.token)
+}
+
+/// Build a client with the given credentials and settings.
+///
+/// Factored out so `/login` can swap in freshly harvested credentials without
+/// restarting the process.
+fn build_client(
+    token: &str,
+    session_id: &Option<String>,
+    policy: api::RetryPolicy,
+    http_timeout: std::time::Duration,
+) -> Result<api::DeepSeekClient> {
+    // Accept a bare token as well as a full `Bearer ...` value, so a token
+    // harvested from the browser can be stored without a scheme prefix.
+    let token = token.trim();
+    let bearer = if token.to_ascii_lowercase().starts_with("bearer ") {
+        token.to_string()
+    } else {
+        format!("Bearer {token}")
+    };
+    let mut client = api::DeepSeekClient::new(session_id.clone(), bearer)?;
+    client.set_policy(policy);
+    client.set_http_timeout(http_timeout);
+    Ok(client)
 }
 
 /// Attach the active-goal reminder to an outgoing message so the model keeps
@@ -860,7 +982,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    let bearer = require_secret("AUTHORIZATION_TOKEN", "full 'Bearer ...' value")?;
+    // Credentials: an explicit environment/file token wins, otherwise sign in
+    // through the browser.  `--login` forces a fresh browser sign-in.
+    let bearer = if args.login {
+        interactive_login(args.no_browser, &[])?
+    } else {
+        match std::env::var("AUTHORIZATION_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(t) => t,
+            None => interactive_login(args.no_browser, &[])?,
+        }
+    };
     // Optional: only the bearer token is checked by the API (see
     // `DeepSeekClient::new`).  Treat an empty value as absent so a `.env` line
     // like `DS_SESSION_ID=` does not send a blank cookie.
@@ -876,8 +1011,6 @@ async fn main() -> Result<()> {
     let thinking = env_flag("DS_THINKING", true);
     let search = env_flag("DS_SEARCH", true);
 
-    let mut client = api::DeepSeekClient::new(session_id, bearer)?;
-
     // Rate-limit policy, tunable from the environment.
     let policy = api::RetryPolicy {
         base: std::time::Duration::from_millis(env_u64("DS_RETRY_BASE_MS", 500)),
@@ -890,42 +1023,65 @@ async fn main() -> Result<()> {
             policy.base, policy.cap, policy.min_gap
         );
     }
-    client.set_policy(policy);
-    client.set_http_timeout(std::time::Duration::from_millis(env_u64(
-        "DS_HTTP_TIMEOUT_MS",
-        180_000,
-    )));
+    let http_timeout = std::time::Duration::from_millis(env_u64("DS_HTTP_TIMEOUT_MS", 180_000));
+    // Route SIGINT to cooperative cancellation so Ctrl+C aborts the current
+    // turn instead of killing the process while the model streams or a shell
+    // command runs.
+    let interrupt = Interrupt::new();
+    spawn_sigint_handler(&interrupt);
 
-    // Prove the token still works before starting the prompt loop.  If the
-    // session was revoked (e.g. "logged out elsewhere"), say so plainly and
-    // point at the credential, instead of surfacing a 40003 on the first turn.
-    match client.check_auth().await {
-        Ok(email) => {
-            if env_flag("DS_DEBUG_SECRETS", false) {
-                eprintln!("[auth] signed in as {email}");
+    let mut client = build_client(&bearer, &session_id, policy, http_timeout)?;
+    client.set_cancel(interrupt.subscribe());
+
+    // Prove the token still works before starting the prompt loop.  A revoked
+    // or expired token triggers another browser sign-in rather than an error:
+    // the whole point is that the user never has to handle the credential.
+    for attempt in 0..3u32 {
+        match client.check_auth().await {
+            Ok(email) => {
+                if env_flag("DS_DEBUG_SECRETS", false) {
+                    eprintln!("[auth] signed in as {email}");
+                }
+                break;
+            }
+            Err(e) if api::is_auth_error(&format!("{e:#}")) => {
+                eprintln!(
+                    "{} DeepSeek rejected the saved credentials: {e:#}",
+                    paint("1;33", "[warn]")
+                );
+                if attempt == 2 {
+                    eprintln!(
+                        "{} giving up on sign-in; set AUTHORIZATION_TOKEN in {}",
+                        paint("1;31", "[error]"),
+                        secrets_path_or_default().display()
+                    );
+                    std::process::exit(1);
+                }
+                eprintln!(
+                    "{} starting a new browser sign-in ({} of 3)",
+                    paint("36", "[login]"),
+                    attempt + 1
+                );
+                // Force a fresh harvest: drop the rejected value so the
+                // discovery loop does not immediately re-read it.
+                std::env::remove_var("AUTHORIZATION_TOKEN");
+                let fresh_token =
+                    interactive_login(args.no_browser, std::slice::from_ref(&bearer))?;
+                client = build_client(&fresh_token, &session_id, policy, http_timeout)?;
+                client.set_cancel(interrupt.subscribe());
+                continue;
+            }
+            Err(e) => {
+                // Anything else (DNS hiccup, captive portal, ...) is not proof
+                // the token is bad; warn and let the turn-level retry logic deal
+                // with it.
+                eprintln!(
+                    "{} could not verify credentials yet: {e:#}",
+                    paint("1;33", "[warn]")
+                );
+                break;
             }
         }
-        Err(e) if api::is_auth_error(&format!("{e:#}")) => {
-            eprintln!(
-                "{} DeepSeek rejected the saved credentials: {e:#}",
-                paint("1;31", "[error]")
-            );
-            eprintln!(
-                "{} refresh AUTHORIZATION_TOKEN (and optionally DS_SESSION_ID) in {}",
-                paint("1;33", "[hint]"),
-                secrets_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "~/.config/deepseek-web-cli/.env".to_string())
-            );
-            std::process::exit(1);
-        }
-        // Anything else (DNS hiccup, captive portal, ...) is not proof the
-        // token is bad; warn and let the turn-level retry logic deal with it.
-        Err(e) => eprintln!(
-            "{} could not verify credentials yet: {e:#}",
-            paint("1;33", "[warn]")
-        ),
     }
 
     // The system prompt is prepended to the first user message of each
@@ -941,18 +1097,12 @@ async fn main() -> Result<()> {
 
     let mut rl = DefaultEditor::new()?;
 
-    // Route SIGINT to cooperative cancellation so Ctrl+C aborts the current
-    // turn instead of killing the process while the model streams or a shell
-    // command runs.
-    let interrupt = Interrupt::new();
-    spawn_sigint_handler(&interrupt);
-
     println!("{}", paint("1;36", "DeepSeek Web CLI \u{2014} multi-turn"));
     println!("  {}   new conversation", paint("32", "/new"));
     println!("  {}   show conversation tip", paint("33", "/id"));
     println!("  {}   set/start/show/clear goal", paint("35", "/goal"));
     println!(
-        "  {}   list conversations ({} more to page)",
+        "  {}   list conversations ({} to page)",
         paint("34", "/sessions"),
         paint("2", "/sessions more")
     );
@@ -962,6 +1112,11 @@ async fn main() -> Result<()> {
         paint("34", "/label")
     );
     println!("  {}   forget a saved conversation", paint("34", "/forget"));
+    println!(
+        "  {}   sign in again through the browser",
+        paint("34", "/login")
+    );
+    println!("  {}  drop the saved token", paint("34", "/logout"));
     println!("  {}   quit (Ctrl+D also quits)", paint("31", "exit"));
     println!(
         "  {} Ctrl+C cancels the current reply/command (or clears the prompt)",
@@ -1107,6 +1262,64 @@ async fn main() -> Result<()> {
                             paint("2", "(applied once a conversation starts)")
                         );
                     }
+                }
+                continue;
+            }
+            Ok(input) if input.trim() == "/login" || input.trim() == "/logout" => {
+                if input.trim() == "/logout" {
+                    // Forget the token: remove it from the environment and the
+                    // secrets file, so the next run signs in again.
+                    std::env::remove_var("AUTHORIZATION_TOKEN");
+                    let path = secrets_path_or_default();
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) => {
+                            let kept = login::remove_key(&text, "AUTHORIZATION_TOKEN");
+                            match std::fs::write(&path, kept) {
+                                Ok(()) => {
+                                    println!(
+                                        "{} token removed from {}",
+                                        paint("32", "[logout]"),
+                                        path.display()
+                                    );
+                                    println!(
+                                        "{} the browser session is untouched: sign out there too, \
+                                         otherwise the next run signs in with it again",
+                                        paint("2", "note:")
+                                    );
+                                }
+                                Err(e) => eprintln!(
+                                    "{} could not rewrite {}: {e:#}",
+                                    paint("1;31", "[error]"),
+                                    path.display()
+                                ),
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "{} could not read {}: {e:#}",
+                            paint("1;31", "[error]"),
+                            path.display()
+                        ),
+                    }
+                    continue;
+                }
+                // A fresh browser sign-in, replacing the current credentials.
+                match interactive_login(args.no_browser, &[]) {
+                    Ok(token) => match build_client(&token, &session_id, policy, http_timeout) {
+                        Ok(mut fresh) => match fresh.check_auth().await {
+                            Ok(email) => {
+                                fresh.set_cancel(interrupt.subscribe());
+                                client = fresh;
+                                let _ = &token;
+                                println!("{} signed in as {email}", paint("32", "[login]"));
+                            }
+                            Err(e) => eprintln!(
+                                "{} signed in, but the token was rejected: {e:#}",
+                                paint("1;31", "[error]")
+                            ),
+                        },
+                        Err(e) => eprintln!("{} {e:#}", paint("1;31", "[error]")),
+                    },
+                    Err(e) => eprintln!("{} sign-in failed: {e:#}", paint("1;31", "[error]")),
                 }
                 continue;
             }

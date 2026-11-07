@@ -16,13 +16,38 @@ run shell commands the model proposes, with your approval by default.
 | Option | Effect |
 | --- | --- |
 | `-y`, `--auto-approve` | run model-proposed shell commands without asking (opt-in) |
+| `--login` | sign in through the browser even if a token is already saved |
+| `--no-browser` | during sign-in, print the URL instead of opening a browser |
 | `-h`, `--help` | show help and exit |
+
+## Signing in
+
+You do not have to copy a token out of the browser. On first run, if no
+credential is configured, the tool opens <https://chat.deepseek.com/sign_in>
+in your browser and waits for you to sign in the way you normally do (password,
+Google, phone, ...). As soon as the web app has stored its token, the CLI picks
+it up, verifies it, and saves it to the user-wide secrets file so later runs
+start straight away. Pass `--login` to repeat this at any time, or type
+`/login` in the session; `/logout` drops the saved token.
+
+How it works: after a sign-in the web app keeps the bearer token in the
+browser's local storage under `userToken`, which is exactly the value the API
+expects. The CLI reads that entry from the local profile - **read-only, from a
+copy**, so a running browser is never disturbed and nothing is written back.
+Firefox (`storage/default/https+++chat.deepseek.com/ls/data.sqlite`) and
+Chromium-family browsers (Chrome, Chromium, Edge, Brave, Vivaldi; the
+`Local Storage/leveldb` database) are supported, including Snap/Flatpak paths
+and the Windows locations.
+
+If no browser data can be read (headless machine, unusual setup) the URL is
+printed so you can sign in elsewhere, or you can set the token yourself as
+described below.
 
 ## Credentials
 
 | Variable | Meaning |
 | --- | --- |
-| `AUTHORIZATION_TOKEN` | **required.** The full `Bearer ...` value sent by the web app |
+| `AUTHORIZATION_TOKEN` | The `Bearer ...` value (a bare token also works). Optional - without it the browser sign-in runs. |
 | `DS_SESSION_ID` | optional. The `ds_session_id` cookie from chat.deepseek.com |
 
 Only the bearer token is checked by the API. `DS_SESSION_ID` may be omitted
@@ -31,23 +56,29 @@ header is sent at all. The tool keeps no cookie jar of its own, so it can never
 replay a cookie the user did not configure.
 
 At startup the token is verified against `users/current`. If it has been
-revoked or has expired the tool says so and points at the secrets file instead
-of failing on the first prompt.
+revoked or has expired, the tool starts another browser sign-in instead of
+failing; after three rejected attempts it gives up and says where the secrets
+file lives.
 
-They are read from the environment first, then from a user-wide secrets file:
+Credentials are read from the environment first, then from a user-wide secrets
+file:
 
 1. `$DS_SECRETS_FILE`
 2. `$XDG_CONFIG_HOME/deepseek-web-cli/.env`
 3. `~/.config/deepseek-web-cli/.env`
 
 The file uses one `KEY=VALUE` per line; `#` comments, an `export ` prefix and
-matching quotes are accepted. Real environment variables always win.
+matching quotes are accepted. Real environment variables always win. A token
+harvested by `--login`/`/login` is written here with mode `0600`, replacing any
+previous `AUTHORIZATION_TOKEN` line and leaving the rest of the file untouched.
 
 ## Commands
 
 | Input | Effect |
 | --- | --- |
 | `exit` / Ctrl+D | quit |
+| `/login` | sign in again through the browser (replaces the saved token) |
+| `/logout` | remove the saved token from the secrets file (sign out in the browser too, or the next run re-reads that session) |
 | `/new` | start a fresh conversation (the old one stays resumable) |
 | `/id` | show the current conversation tip |
 | `/goal <text>` | set a goal and let the model work until it reports completion |
@@ -75,7 +106,7 @@ prompt; at the prompt it just clears the line.
 | `DS_RETRY_CAP_MS` | `60000` | backoff ceiling |
 | `DS_MIN_GAP_MS` | `0` | minimum spacing between requests |
 | `DS_GOALS_FILE` | XDG data dir | where per-conversation goals live |
-| `DS_SECRETS_FILE` | XDG config dir | where credentials are read from |
+| `DS_SECRETS_FILE` | XDG config dir | where credentials are read from and saved |
 | `DS_DEBUG_PENDING` | `0` | dump model output and extracted commands |
 | `DS_DEBUG_SECRETS` | `0` | report which secrets file was loaded |
 | `NO_COLOR` / `CLICOLOR_FORCE` | - | follow https://no-color.org |
