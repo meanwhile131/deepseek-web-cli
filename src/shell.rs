@@ -1,8 +1,8 @@
 //! Shell command extraction and execution.
 //!
 //! Commands are extracted from model output, run under `sh -c` with a
-//! wall-clock limit, and their output is bounded and sanitized before it is
-//! echoed back to the model.
+//! wall-clock limit, and their output is bounded before it is echoed back to
+//! the model.
 
 use anyhow::{Context, Result};
 use std::process::Stdio;
@@ -61,7 +61,7 @@ pub struct ShellCommand {
 /// for the terminal. On timeout the child *and its process group* are killed,
 /// so backgrounded grandchildren do not outlive the turn; the model is told
 /// about it as ordinary output. Output is truncated to `max_output_bytes()`
-/// per stream and stripped of anything that looks like a tool-call tag.
+/// per stream.
 pub async fn run_shell(cmd: &str, timeout: Duration) -> Result<String> {
     #[cfg(windows)]
     let mut command = {
@@ -127,9 +127,9 @@ pub async fn run_shell(cmd: &str, timeout: Duration) -> Result<String> {
     Ok(result)
 }
 
-/// Decode, sanitize and cap one stream of command output.
+/// Decode and cap one stream of command output.
 fn bounded_output(bytes: &[u8], cap: usize) -> String {
-    sanitize_output(&truncate_middle(&String::from_utf8_lossy(bytes), cap))
+    truncate_middle(&String::from_utf8_lossy(bytes), cap)
 }
 
 /// Keep the head and tail of `s`, replacing the middle when it is longer than
@@ -162,16 +162,6 @@ fn ceil_boundary(s: &str, mut i: usize) -> usize {
         i += 1;
     }
     i
-}
-
-/// Defang tool-call delimiters in captured text.
-///
-/// Command output is untrusted: a file may contain something that looks like a
-/// tool call, and echoing it back verbatim would invite the model to treat it
-/// as one. Breaking the delimiter is enough to make it inert.
-pub fn sanitize_output(s: &str) -> String {
-    s.replace("\x3cshell", "\x3c shell")
-        .replace("\x3c/shell", "\x3c /shell")
 }
 
 // Tag delimiters, spelled with escapes so this source file does not itself
@@ -307,16 +297,6 @@ mod tests {
     fn ignores_unclosed_or_similar_tags() {
         assert!(extract_shell_commands("\x3cshell>no end").is_empty());
         assert!(extract_shell_commands("\x3cshellfish>oops\x3c/shellfish\x3e").is_empty());
-    }
-
-    #[test]
-    fn sanitizes_tool_call_tags_in_output() {
-        let text = format!("before {} after", block("", "rm -rf /"));
-        let clean = sanitize_output(&text);
-        assert!(!clean.contains(OPEN), "raw opening tag survived: {clean}");
-        assert!(!clean.contains(CLOSE), "raw closing tag survived: {clean}");
-        // Ordinary angle brackets are left alone.
-        assert_eq!(sanitize_output("a < b > c"), "a < b > c");
     }
 
     #[test]

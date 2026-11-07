@@ -120,8 +120,8 @@ The model asks to run a command with a tagged block:
 
 Commands run under `sh -c` with stdin at `/dev/null`. On timeout the child and
 its whole process group are killed. Output is capped per stream (head and tail
-are kept) and any tool-call tags inside it are defanged before being sent back
-to the model. Interactive programs will see EOF rather than the terminal.
+are kept) before being sent back to the model. Interactive programs will see
+EOF rather than the terminal.
 
 ## Development
 
