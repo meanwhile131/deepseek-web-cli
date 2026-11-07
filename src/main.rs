@@ -16,13 +16,9 @@ use std::path::PathBuf;
 use tokio::sync::watch;
 
 const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with access to a local shell.
-When you need to run a command, emit it exactly as:
+To run commands, emit blocks in exactly this form (never inside private reasoning, never in markdown fences):
 <shell>command goes here</shell>
-The user will execute it and reply with [SHELL OUTPUT] followed by the result.
-Use one <shell> block per command.  Do not wrap commands in markdown fences.
-Always batch multiple commands into one response.
-Command blocks must appear in your visible reply, never inside private reasoning.
-Each command has a default timeout of 120 seconds; a command that runs longer is killed. To change the timeout for a single command, add a timeout attribute in seconds (or with an s/m/h suffix), for example <shell timeout="300">long command</shell>. Omit the attribute to use the default."#;
+Each block runs one command; batch several into a single reply. The user executes them and replies with [SHELL OUTPUT] followed by the result."#;
 
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";

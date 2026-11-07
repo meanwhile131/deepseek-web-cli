@@ -104,8 +104,11 @@ pub async fn run_shell(cmd: &str, timeout: Duration) -> Result<String> {
                 }
             }
             return Ok(format!(
-                "[command timed out after {}s and was killed]",
-                timeout.as_secs_f64()
+                "[command timed out after {}s and was killed. Default timeout is {}s; \
+                 to allow more time, add a timeout attribute to the opening tag, e.g. \
+                 <shell timeout=\"300\"> or <shell timeout=5m> (s/m/h suffixes accepted).]",
+                timeout.as_secs_f64(),
+                default_timeout().as_secs(),
             ));
         }
     };
@@ -329,6 +332,11 @@ mod tests {
             .await
             .expect("run_shell should not error on timeout");
         assert!(out.contains("timed out"), "unexpected output: {out}");
+        // The hint about raising the limit must travel with the error.
+        assert!(
+            out.contains("timeout attribute"),
+            "missing timeout hint: {out}"
+        );
         // Must return promptly rather than waiting the full 10s.
         assert!(start.elapsed() < Duration::from_secs(5));
     }
