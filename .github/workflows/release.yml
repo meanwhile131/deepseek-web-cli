@@ -1,7 +1,9 @@
 name: Release
 
-# Binaries are built on every commit:
-#   * push to main      -> rolling pre-release tagged `latest` (assets replaced)
+# Binaries are built and released on every commit:
+#   * push to main      -> a new release tagged `build-<sha>` for that commit,
+#                          marked as the repository's Latest; old build
+#                          releases beyond the newest KEEP are pruned
 #   * push of a v* tag  -> versioned release `v<version>` (assets for cargo-binstall)
 on:
   push:
@@ -93,22 +95,23 @@ jobs:
       - name: List assets
         run: ls -lR artifacts
 
-      # Rolling release, refreshed on every commit to main. It is a full
-      # (non-prerelease) release so GitHub marks it as the repository's latest.
-      # `--latest` is passed explicitly because GitHub otherwise refuses to
-      # move the "latest" marker onto a release whose tag is not the newest
-      # semver tag.
-      - name: Publish rolling `latest` release
+      # One release per commit to main: a fresh `build-<sha>` tag each time,
+      # marked Latest once its assets are in place. Releases are immutable
+      # records of a commit; only the newest KEEP of them are retained.
+      - name: Publish release for this commit
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          KEEP: "10"
         run: |
           set -euo pipefail
-          tag=latest
+          tag="build-${GITHUB_SHA:0:12}"
           short="${GITHUB_SHA:0:7}"
-          title="Latest build ($short)"
-          body="Rolling build of \`${GITHUB_SHA}\` from \`main\` on $(date -u +%Y-%m-%dT%H:%M:%SZ). Assets are replaced on every commit. This release always tracks the newest commit on \`main\`."
+          title="Build ${short}"
+          body="Binaries built from commit \`${GITHUB_SHA}\` on \`main\` at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+
+          # Re-running a commit reuses its release; otherwise create a new one.
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" \
               --target "$GITHUB_SHA" \
@@ -116,13 +119,21 @@ jobs:
               --notes "$body"
           gh release edit "$tag" --title "$title" --notes "$body" \
             --prerelease=false --target "$GITHUB_SHA"
-          # Move the rolling tag onto this commit so the release page points at
-          # the code the binaries were built from.
-          gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/${tag}" \
-            -f sha="${GITHUB_SHA}" -F force=true >/dev/null
           gh release upload "$tag" artifacts/* --clobber
-          # Mark it latest last, after assets are in place.
+          # Mark latest only after the assets exist, so /releases/latest never
+          # points at a half-populated release.
           gh release edit "$tag" --latest
+
+          # Prune older per-commit releases (never v* tags or the current one).
+          gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name | startswith("build-")) | [.tag_name, .created_at] | @tsv' \
+            | sort -k2 -r \
+            | tail -n +"$((KEEP + 1))" \
+            | while IFS=$'\t' read -r old_tag _; do
+                [ "$old_tag" = "$tag" ] && continue
+                echo "Pruning $old_tag"
+                gh release delete "$old_tag" --yes --cleanup-tag
+              done
 
       # Versioned release for v* tags; matches package.metadata.binstall.
       - name: Publish tagged release

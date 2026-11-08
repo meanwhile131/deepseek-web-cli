@@ -25,14 +25,22 @@ Otherwise build from source:
 
 [release]: https://github.com/meanwhile131/deepseek-web-cli/releases
 
-Every push to `main` also refreshes a rolling [latest build][latest] release —
-a full release tagged `latest`, refreshed and marked as the repository's
-"Latest" on each commit, with its assets replaced and its tag force-moved to
-the new commit, so you can always grab a binary built from the newest code:
+### Every commit
 
-    gh release download latest --repo meanwhile131/deepseek-web-cli --pattern '*linux-gnu.tar.gz'
+Every push to `main` publishes its own release, tagged
+`build-<first 12 chars of the commit sha>`, containing both target archives. The newest build is
+marked as the repository's "Latest" release; the newest 10 are kept and older
+ones are pruned automatically. Grab the latest build with:
 
-[latest]: https://github.com/meanwhile131/deepseek-web-cli/releases/tag/latest
+    gh release download --repo meanwhile131/deepseek-web-cli \
+      --pattern '*linux-gnu.tar.gz' "$(gh release view --repo meanwhile131/deepseek-web-cli --json tagName -q .tagName)"
+
+Or download a specific commit's build:
+
+    gh release download build-<sha> --repo meanwhile131/deepseek-web-cli
+
+Version tags (`v*`) still publish their own release, which is what
+`cargo binstall` resolves against.
 
 ## Usage
 
