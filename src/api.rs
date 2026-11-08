@@ -712,6 +712,39 @@ fn continue_body(session_id: &str, message_id: &Value, shumei_device_id: Option<
     body
 }
 
+/// A reply the server cut short mid-generation.
+///
+/// The partial text has already been streamed to the caller and the
+/// conversation tip (`response/message_id`) has been recorded, so
+/// `chat/continue` can resume it.  This is a distinct type rather than a plain
+/// `anyhow!` string so the CLI can tell a truncated reply apart from ordinary
+/// errors and resume it automatically instead of aborting the turn.
+#[derive(Debug)]
+pub struct Truncated {
+    /// Endpoint that was streaming, e.g. `completion`.
+    pub label: &'static str,
+    /// Why the server stopped, as reported in the stream/toast.
+    pub reason: String,
+}
+
+impl std::fmt::Display for Truncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: reply cut short by the server ({})",
+            self.label, self.reason
+        )
+    }
+}
+
+impl std::error::Error for Truncated {}
+
+/// Whether `err` means the reply stopped mid-generation (see [`Truncated`]),
+/// i.e. the stream produced output but never reached FINISHED.
+pub fn is_truncated(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Truncated>().is_some()
+}
+
 pub struct DeepSeekClient {
     http: Client,
     /// Kept so the client can be rebuilt when the timeout changes.
@@ -1309,7 +1342,13 @@ impl DeepSeekClient {
                                 );
                                 break;
                             }
-                            yield Err(anyhow::Error::from(e));
+                            // A drop after output is a cut-short reply, not a
+                            // failed request: the tip is known, so the CLI can
+                            // resume it via `chat/continue`.
+                            yield Err(anyhow::Error::new(Truncated {
+                                label,
+                                reason: e.to_string(),
+                            }));
                             return;
                         }
                     }
@@ -1361,10 +1400,7 @@ impl DeepSeekClient {
                 // and point at the endpoint that resumes it rather than
                 // pretending the reply was complete.
                 if let Some(reason) = generation_error.take() {
-                    yield Err(anyhow::anyhow!(
-                        "{label}: reply cut short by the server ({reason}); \
-                         run /continue to resume message generation"
-                    ));
+                    yield Err(anyhow::Error::new(Truncated { label, reason }));
                     return;
                 }
                 // We rendered content but never saw FINISHED; accept it.
@@ -1609,6 +1645,17 @@ mod tests {
         });
         assert!(!event_rate_limited(&evt), "not a rate limit");
         assert!(evt.get("finish_reason").and_then(|v| v.as_str()) == Some("generation_err"));
+    }
+
+    #[test]
+    fn truncated_error_is_recognisable_and_resumable() {
+        let err = anyhow::Error::new(Truncated {
+            label: "continue",
+            reason: "Server is temporarily unavailable.".to_string(),
+        });
+        assert!(is_truncated(&err));
+        assert!(format!("{err:#}").contains("reply cut short"));
+        assert!(!is_truncated(&anyhow::anyhow!("stream error: boom")));
     }
 
     #[test]

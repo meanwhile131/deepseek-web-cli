@@ -35,6 +35,13 @@ const GOAL_DONE: &str = "[GOAL COMPLETE]";
 /// again, or raised with `DS_MAX_GOAL_TURNS`.
 const DEFAULT_MAX_GOAL_TURNS: usize = 25;
 
+/// Hard cap on automatic `/continue` resumes for one cut-short reply.
+///
+/// Each resume costs one `chat/continue` request, so a server that truncates
+/// every stream would otherwise loop forever. Override with
+/// `DS_MAX_AUTO_CONTINUES`; `0` disables automatic resuming entirely.
+const DEFAULT_MAX_AUTO_CONTINUES: usize = 5;
+
 /// Hard cap on shell round-trips inside a single turn.
 ///
 /// Every iteration sends one more completion request, so an unproductive
@@ -639,15 +646,80 @@ enum ReplySource<'a> {
 ///
 /// With [`ReplySource::Continue`] the reply is resumed through
 /// `chat/continue` instead of a fresh `chat/completion`.
+///
+/// A reply the server cuts short mid-generation is resumed automatically: the
+/// stream reports a [`api::Truncated`] error after the partial text has been
+/// rendered and the conversation tip recorded, so the very endpoint `/continue`
+/// drives is re-opened without the user having to type it. That is bounded by
+/// `DS_MAX_AUTO_CONTINUES` (default [`DEFAULT_MAX_AUTO_CONTINUES`]) so a server
+/// that keeps truncating cannot spin the turn forever; once the budget is
+/// spent the truncation is reported as before, pointing at `/continue`.
 async fn stream_reply(
     client: &mut api::DeepSeekClient,
     source: ReplySource<'_>,
     thinking: bool,
     search: bool,
 ) -> Result<(String, String)> {
-    let mut s = match source {
-        ReplySource::Message(message) => client.send_message(message, thinking, search).await?,
-        ReplySource::Continue => client.continue_message().await?,
+    let max_resumes = env_u64("DS_MAX_AUTO_CONTINUES", DEFAULT_MAX_AUTO_CONTINUES as u64) as usize;
+    let mut resumes = 0usize;
+    let mut source = source;
+    // Text from earlier, cut-short attempts is kept so command extraction sees
+    // the whole reply rather than only the piece that arrived after resuming.
+    let mut visible = String::new();
+    let mut reasoning = String::new();
+    loop {
+        let (v, r, err) = stream_once(client, source, thinking, search).await;
+        visible.push_str(&v);
+        reasoning.push_str(&r);
+        let Some(err) = err else {
+            return Ok((visible, reasoning));
+        };
+        // Only a mid-generation cut is resumable; anything else (auth, bad
+        // request, exhausted retries) belongs to the caller.
+        if !should_auto_resume(api::is_truncated(&err), resumes, max_resumes) {
+            if api::is_truncated(&err) {
+                return Err(err.context(format!(
+                    "still truncated after {resumes} automatic /continue attempt(s); \
+                     run /continue to resume message generation"
+                )));
+            }
+            return Err(err);
+        }
+        resumes += 1;
+        println!(
+            "{} {} - resuming automatically ({}/{max_resumes})",
+            paint("1;33", "[cut short]"),
+            format_args!("{err}"),
+            resumes
+        );
+        source = ReplySource::Continue;
+    }
+}
+
+/// Whether a failed streaming attempt should be resumed with `chat/continue`
+/// instead of surfacing the error.
+///
+/// Only a mid-generation cut is resumable, and only while the per-reply budget
+/// (`DS_MAX_AUTO_CONTINUES`) is unspent.
+fn should_auto_resume(truncated: bool, resumes: usize, max: usize) -> bool {
+    truncated && resumes < max
+}
+
+/// One streaming attempt. Returns the text rendered so far plus the error, if
+/// any, so a cut-short reply can keep its partial output. The renderer is
+/// always finished (restoring terminal color) before returning.
+async fn stream_once(
+    client: &mut api::DeepSeekClient,
+    source: ReplySource<'_>,
+    thinking: bool,
+    search: bool,
+) -> (String, String, Option<anyhow::Error>) {
+    let mut s = match match source {
+        ReplySource::Message(message) => client.send_message(message, thinking, search).await,
+        ReplySource::Continue => client.continue_message().await,
+    } {
+        Ok(s) => s,
+        Err(e) => return (String::new(), String::new(), Some(e)),
     };
     let mut visible = String::new();
     let mut reasoning = String::new();
@@ -666,10 +738,7 @@ async fn stream_reply(
     renderer.finish(&mut visible, &mut reasoning);
     out("\n");
     drop(s);
-    if let Some(e) = stream_err {
-        return Err(e);
-    }
-    Ok((visible, reasoning))
+    (visible, reasoning, stream_err)
 }
 
 /// Send `message`, then keep extracting and running shell commands until the
@@ -843,10 +912,12 @@ impl SessionCache {
     /// added.
     async fn fetch_next(&mut self, client: &api::DeepSeekClient) -> Result<usize> {
         // Own the cursor so the borrow on `entries` ends before we mutate it.
+        // Entries are kept oldest-first, so the first row is the oldest loaded
+        // and paging continues backwards in time from there.
         let cursor_owned = self
             .entries
-            .last()
-            .map(|last| (last.updated_at, last.id.clone()));
+            .first()
+            .map(|first| (first.updated_at, first.id.clone()));
         let cursor = cursor_owned.as_ref().map(|(u, id)| (*u, id.as_str()));
 
         let (page, has_more) = client.list_sessions(SESSION_PAGE_SIZE, cursor).await?;
@@ -861,10 +932,10 @@ impl SessionCache {
     /// inclusive the page repeats its cursor row, so a page that adds nothing
     /// means paging has stalled; `has_more` is cleared in that case.
     ///
-    /// After merging, the list is sorted newest-first by `updated_at`, so a
+    /// After merging, the list is sorted oldest-first by `updated_at`, so a
     /// server that returns pages (or rows inside a page) in a different order
-    /// still yields a "latest first" listing. Sorting descending also keeps
-    /// the cursor sane: `fetch_next` pages from `entries.last()`, which is the
+    /// still yields a chronological listing. Sorting ascending also keeps the
+    /// cursor sane: `fetch_next` pages from `entries.first()`, which is the
     /// oldest row loaded so far.
     fn merge_page(&mut self, page: Vec<sessions::SessionEntry>, has_more: bool) -> usize {
         let before = self.entries.len();
@@ -875,11 +946,11 @@ impl SessionCache {
         }
         let added = self.entries.len() - before;
         self.entries.sort_by(|a, b| {
-            b.updated_at
-                .partial_cmp(&a.updated_at)
+            a.updated_at
+                .partial_cmp(&b.updated_at)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 // Stable tie-break so paging and numbering are deterministic.
-                .then_with(|| b.id.cmp(&a.id))
+                .then_with(|| a.id.cmp(&b.id))
         });
         self.has_more = has_more && added > 0;
         added
@@ -953,7 +1024,6 @@ fn print_loaded_sessions(cache: &SessionCache, from: usize) {
 /// Handle `/sessions` and `/sessions more`.
 async fn show_sessions(client: &api::DeepSeekClient, cache: &mut SessionCache, more: bool) {
     if more && cache.started {
-        let from = cache.entries.len();
         if !cache.has_more {
             println!(
                 "{} {}",
@@ -968,7 +1038,9 @@ async fn show_sessions(client: &api::DeepSeekClient, cache: &mut SessionCache, m
                 paint("36", "[sessions]"),
                 paint("2", "no more conversations to load")
             ),
-            Ok(_) => print_loaded_sessions(cache, from),
+            // Entries are kept oldest-first, so an older page is prepended and
+            // every row's number shifts; reprint the whole list.
+            Ok(_) => print_loaded_sessions(cache, 0),
             Err(e) => eprintln!(
                 "{} could not list sessions: {e:#}",
                 paint("1;31", "[error]")
@@ -977,7 +1049,8 @@ async fn show_sessions(client: &api::DeepSeekClient, cache: &mut SessionCache, m
         return;
     }
 
-    // A plain `/sessions` restarts from the newest conversation.
+    // A plain `/sessions` restarts from the most recent page of conversations,
+    // listed oldest-to-newest.
     cache.reset();
     match cache.fetch_next(client).await {
         Ok(_) => print_loaded_sessions(cache, 0),
@@ -1664,10 +1737,22 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        goal_completed, parse_args, parse_goal_command, parse_secrets, with_goal, GoalCommand,
-        ParsedArgs, SessionCache,
+        goal_completed, parse_args, parse_goal_command, parse_secrets, should_auto_resume,
+        with_goal, GoalCommand, ParsedArgs, SessionCache,
     };
     use crate::sessions;
+
+    #[test]
+    fn auto_resume_only_for_truncation_within_budget() {
+        // Cut-short replies resume while the budget lasts...
+        assert!(should_auto_resume(true, 0, 5));
+        assert!(should_auto_resume(true, 4, 5));
+        // ...but not once it is spent, and never for unrelated errors.
+        assert!(!should_auto_resume(true, 5, 5));
+        assert!(!should_auto_resume(false, 0, 5));
+        // A budget of zero disables automatic resuming entirely.
+        assert!(!should_auto_resume(true, 0, 0));
+    }
 
     #[test]
     fn no_goal_is_passthrough() {
@@ -1755,7 +1840,7 @@ mod tests {
         );
         assert_eq!(
             c.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-            vec!["a", "b", "c"]
+            vec!["c", "b", "a"]
         );
         assert!(!c.has_more);
     }
@@ -1771,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_orders_latest_first() {
+    fn merge_orders_oldest_first() {
         let mut c = SessionCache::default();
         // Server returns rows out of order; the cache must normalise them.
         c.merge_page(
@@ -1780,22 +1865,22 @@ mod tests {
         );
         assert_eq!(
             c.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-            vec!["new", "mid", "old"]
+            vec!["old", "mid", "new"]
         );
     }
 
     #[test]
-    fn merge_keeps_latest_first_across_pages() {
+    fn merge_keeps_oldest_first_across_pages() {
         let mut c = SessionCache::default();
         c.merge_page(vec![entry("a", 3.0), entry("b", 2.0)], true);
         // An older page arrives late and is not in order either.
         c.merge_page(vec![entry("d", 1.0), entry("c", 1.5)], false);
         assert_eq!(
             c.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-            vec!["a", "b", "c", "d"]
+            vec!["d", "c", "b", "a"]
         );
         // The cursor for the next page is the oldest row loaded.
-        assert_eq!(c.entries.last().unwrap().id, "d");
+        assert_eq!(c.entries.first().unwrap().id, "d");
     }
 
     #[test]

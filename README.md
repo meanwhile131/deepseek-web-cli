@@ -96,8 +96,8 @@ previous `AUTHORIZATION_TOKEN` line and leaving the rest of the file untouched.
 | `/goal <text>` | set a goal and let the model work until it reports completion |
 | `/goal`, `/goal show`, `/goal status` | show the active goal |
 | `/goal clear`, `none`, `off` | drop the active goal |
-| `/sessions` | list conversations, newest first |
-| `/sessions more` | load the next page |
+| `/sessions` | list conversations, oldest first |
+| `/sessions more` | load the next (older) page |
 | `/resume <n|id-prefix>` | continue a saved conversation (restores its goal) |
 | `/label <text>` | rename the current conversation |
 | `/forget <n|id-prefix>` | delete a conversation on the server |
@@ -117,9 +117,17 @@ interrupted assistant message instead of paying for a whole new completion.
 The endpoint returns the same SSE event stream as `chat/completion` and needs
 no proof of work - only the bearer token. The client tracks the assistant
 message id from the stream, so `/continue` resumes whatever reply was last cut
-off in the current conversation. If the server reports a generation error, the
-CLI prints it and suggests `/continue` rather than silently accepting a
-truncated answer.
+off in the current conversation.
+
+When a reply is cut short mid-generation (a `generation_err` toast, or the
+connection dropping after some output), the CLI resumes it **automatically** by
+posting to `chat/continue` itself - no need to type `/continue`, and no new
+completion is charged. The partial text stays on screen and streaming picks up
+where it stopped. Each cut-short reply is resumed at most `DS_MAX_AUTO_CONTINUES`
+times (default 5) so a server that keeps truncating cannot loop forever; once
+that budget is spent the truncation is reported and `/continue` remains
+available to try again by hand. `/continue` is still useful when you come back
+to a conversation whose reply was interrupted in an earlier session.
 
 Ctrl+C cancels the current reply, command, or retry backoff and returns to the
 prompt; at the prompt it just clears the line.
@@ -145,6 +153,7 @@ a space to keep it out of the history.
 | `DS_MAX_RETRIES` | `0` | retries per request before giving up (`0` = unlimited, the default) |
 | `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
 | `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
+| `DS_MAX_AUTO_CONTINUES` | `5` | how many times a cut-short reply is resumed with `chat/continue` automatically (`0` disables) |
 | `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |
 
 Requests are paced and retries back off exponentially (base x4 per attempt,
