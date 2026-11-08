@@ -1884,6 +1884,27 @@ mod tests {
     }
 
     #[test]
+    fn latest_session_is_last_in_the_list() {
+        // The server hands back the most recently updated conversations first;
+        // the cache must keep them so the latest one prints at the end of the
+        // list, not the beginning.
+        let mut c = SessionCache::default();
+        c.merge_page(
+            vec![
+                entry("newest", 30.0),
+                entry("middle", 20.0),
+                entry("oldest", 10.0),
+            ],
+            true,
+        );
+        c.merge_page(vec![entry("older", 5.0)], false);
+        let ids: Vec<&str> = c.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids.last().copied(), Some("newest"));
+        assert_eq!(ids.first().copied(), Some("older"));
+        assert_eq!(ids, vec!["older", "oldest", "middle", "newest"]);
+    }
+
+    #[test]
     fn history_round_trips_through_a_file() {
         // The same builder/config the prompt loop uses: entries added during a
         // session survive a save/reload cycle, so up/down works across runs.
