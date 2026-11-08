@@ -15,14 +15,32 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::sync::watch;
 
-const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with access to a local shell.
-To run commands, emit blocks in exactly this form (never inside private reasoning, never in markdown fences):
+const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with a local shell.
+Run commands in blocks of exactly this form (never in reasoning, never in markdown fences):
 <shell>command goes here</shell>
-Each block runs one command; batch several into a single reply. Blocks are executed automatically and the result is sent back to you as [SHELL OUTPUT].
-By default commands are confined to the current working directory: that is their working directory and their HOME. Where the OS provides a sandbox (bubblewrap on Linux, sandbox-exec on macOS) the rest of the filesystem is read-only, so do not try to write outside it. Respect that boundary."#;
+One command per block; batch several per reply. Blocks run automatically; output returns as [SHELL OUTPUT].
+Commands run in the current directory, which is also HOME. The rest of the filesystem is read-only (bubblewrap/sandbox-exec), so do not write outside it."#;
 
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";
+
+/// Hard cap on consecutive goal turns before handing control back to the user.
+///
+/// This used to be unlimited: `/goal` would reprompt the model forever until it
+/// emitted the completion token, issuing a fresh completion request each time.
+/// A model that never emits the token (or a goal that cannot be finished)
+/// turned that into an endless request loop - the exact traffic pattern that
+/// gets an account flagged for botting. The cap is a request budget, not a
+/// deadline: a genuinely long goal can be continued by running `/goal <text>`
+/// again, or raised with `DS_MAX_GOAL_TURNS`.
+const DEFAULT_MAX_GOAL_TURNS: usize = 25;
+
+/// Hard cap on shell round-trips inside a single turn.
+///
+/// Every iteration sends one more completion request, so an unproductive
+/// model/tool exchange would otherwise ping-pong forever. Mirrors the goal cap
+/// and is likewise overridable with `DS_MAX_SHELL_ITERS`.
+const DEFAULT_MAX_SHELL_ITERS: usize = 50;
 
 const THINK_OPEN: &str = "\u{27EA}THINK\u{27EB}";
 const THINK_CLOSE: &str = "\u{27EA}/THINK\u{27EB}";
@@ -276,7 +294,14 @@ fn interactive_login(no_browser: bool, rejected: &[String]) -> Result<String> {
     let mut found = login::discover_token(rejected);
 
     if found.is_some() {
-        // A previous browser sign-in is still on disk; reuse it silently.
+        // A previous browser sign-in is still on disk. Reuse it, but say so:
+        // this is the browser's own session credential, not a separate API
+        // key, and the user should know the CLI is riding on that session.
+        println!(
+            "{} reusing the DeepSeek session already stored in your browser \
+             (this is the same session, not a separate key)",
+            paint("2", "[login]")
+        );
     } else {
         println!();
         println!("{}", paint("1;36", "Sign in to DeepSeek"));
@@ -631,9 +656,18 @@ async fn run_turn(
     let mut iter = 0usize;
 
     // Shell loop: keep extracting commands from each reply
-    // (initial + every follow-up) until the model stops.
+    // (initial + every follow-up) until the model stops - but bounded, since
+    // each iteration costs one completion request.
+    let max_iters = env_u64("DS_MAX_SHELL_ITERS", DEFAULT_MAX_SHELL_ITERS as u64).max(1) as usize;
     loop {
         iter += 1;
+        if iter > max_iters {
+            println!(
+                "{} stopped after {max_iters} shell round-trips in one turn",
+                paint("1;33", "[shell limit]")
+            );
+            break;
+        }
 
         if debug_pending {
             eprintln!(
@@ -1015,17 +1049,27 @@ async fn main() -> Result<()> {
     let search = env_flag("DS_SEARCH", true);
 
     // Rate-limit policy, tunable from the environment.
+    //
+    // Defaults are deliberately conservative. A previous version retried
+    // forever with no spacing between requests, which is indistinguishable
+    // from a scraper and is what got accounts flagged for botting.
     let policy = api::RetryPolicy {
-        base: std::time::Duration::from_millis(env_u64("DS_RETRY_BASE_MS", 500)),
+        base: std::time::Duration::from_millis(env_u64("DS_RETRY_BASE_MS", 1_000)),
         cap: std::time::Duration::from_millis(env_u64("DS_RETRY_CAP_MS", 60_000)),
-        min_gap: std::time::Duration::from_millis(env_u64("DS_MIN_GAP_MS", 0)),
+        min_gap: std::time::Duration::from_millis(env_u64("DS_MIN_GAP_MS", 1_500)),
+        max_attempts: env_u64("DS_MAX_RETRIES", 8) as u32,
     };
-    if !policy.min_gap.is_zero() {
-        eprintln!(
-            "[rate-limit] retries=unlimited base={:?} cap={:?} min_gap={:?}",
-            policy.base, policy.cap, policy.min_gap
-        );
-    }
+    eprintln!(
+        "[rate-limit] max_retries={} base={:?} cap={:?} min_gap={:?}",
+        if policy.max_attempts == 0 {
+            "unlimited".to_string()
+        } else {
+            policy.max_attempts.to_string()
+        },
+        policy.base,
+        policy.cap,
+        policy.min_gap
+    );
     let http_timeout = std::time::Duration::from_millis(env_u64("DS_HTTP_TIMEOUT_MS", 180_000));
     // Route SIGINT to cooperative cancellation so Ctrl+C aborts the current
     // turn instead of killing the process while the model streams or a shell
@@ -1036,54 +1080,45 @@ async fn main() -> Result<()> {
     let mut client = build_client(&bearer, &session_id, policy, http_timeout)?;
     client.set_cancel(interrupt.subscribe());
 
-    // Prove the token still works before starting the prompt loop.  A revoked
-    // or expired token triggers another browser sign-in rather than an error:
-    // the whole point is that the user never has to handle the credential.
-    for attempt in 0..3u32 {
-        match client.check_auth().await {
-            Ok(email) => {
-                if env_flag("DS_DEBUG_SECRETS", false) {
-                    eprintln!("[auth] signed in as {email}");
-                }
-                break;
+    // Prove the token still works before starting the prompt loop.
+    //
+    // A rejected token is NOT silently retried. Re-harvesting the browser
+    // token on every failure was the root cause of the "accounts get logged
+    // out" reports: each rejected request causes the server to rotate the
+    // session, which in turn signs the user out of the browser they logged in
+    // with. Worse, retrying three times meant three rotations per start.
+    //
+    // Now a rejected token fails fast with an explicit instruction. Signing in
+    // again is something the user asks for, never something the tool does
+    // behind their back.
+    match client.check_auth().await {
+        Ok(email) => {
+            if env_flag("DS_DEBUG_SECRETS", false) {
+                eprintln!("[auth] signed in as {email}");
             }
-            Err(e) if api::is_auth_error(&format!("{e:#}")) => {
-                eprintln!(
-                    "{} DeepSeek rejected the saved credentials: {e:#}",
-                    paint("1;33", "[warn]")
-                );
-                if attempt == 2 {
-                    eprintln!(
-                        "{} giving up on sign-in; set AUTHORIZATION_TOKEN in {}",
-                        paint("1;31", "[error]"),
-                        secrets_path_or_default().display()
-                    );
-                    std::process::exit(1);
-                }
-                eprintln!(
-                    "{} starting a new browser sign-in ({} of 3)",
-                    paint("36", "[login]"),
-                    attempt + 1
-                );
-                // Force a fresh harvest: drop the rejected value so the
-                // discovery loop does not immediately re-read it.
-                std::env::remove_var("AUTHORIZATION_TOKEN");
-                let fresh_token =
-                    interactive_login(args.no_browser, std::slice::from_ref(&bearer))?;
-                client = build_client(&fresh_token, &session_id, policy, http_timeout)?;
-                client.set_cancel(interrupt.subscribe());
-                continue;
-            }
-            Err(e) => {
-                // Anything else (DNS hiccup, captive portal, ...) is not proof
-                // the token is bad; warn and let the turn-level retry logic deal
-                // with it.
-                eprintln!(
-                    "{} could not verify credentials yet: {e:#}",
-                    paint("1;33", "[warn]")
-                );
-                break;
-            }
+        }
+        Err(e) if api::is_auth_error(&format!("{e:#}")) => {
+            eprintln!(
+                "{} DeepSeek rejected the saved token: {e:#}",
+                paint("1;31", "[error]")
+            );
+            eprintln!(
+                "{} the CLI will not keep re-reading it from your browser: doing so rotates the\
+                 \n  session and signs you out there. Remove the stale token from {} and run\
+                 \n  `deepseek --login` when you are ready to sign in again.",
+                paint("2", "note:"),
+                secrets_path_or_default().display()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            // Anything else (DNS hiccup, captive portal, ...) is not proof the
+            // token is bad; warn and let the turn-level retry logic deal with
+            // it.
+            eprintln!(
+                "{} could not verify credentials yet: {e:#}",
+                paint("1;33", "[warn]")
+            );
         }
     }
 
@@ -1340,11 +1375,22 @@ async fn main() -> Result<()> {
                         goal = Some(text.clone());
                         persist_goal(&client, &goal);
                         println!("{} {text}", paint("32", "[goal set]"));
-                        // Automatically start the model and keep reprompting it
-                        // until it marks the goal complete.
+                        // Start the model and reprompt it until it marks the
+                        // goal complete, but only within a bounded budget (see
+                        // DEFAULT_MAX_GOAL_TURNS).
+                        let max_turns = env_u64("DS_MAX_GOAL_TURNS", DEFAULT_MAX_GOAL_TURNS as u64)
+                            .max(1) as usize;
                         let mut turn = 0usize;
                         loop {
                             turn += 1;
+                            if turn > max_turns {
+                                println!(
+                                    "{} stopped after {max_turns} turns without {GOAL_DONE}; \
+                                     goal kept - continue with /goal <text> or clear with /goal clear",
+                                    paint("1;33", "[goal paused]")
+                                );
+                                break;
+                            }
                             let base = if turn == 1 {
                                 format!(
                                 "Work toward the following goal, using the shell as needed. \

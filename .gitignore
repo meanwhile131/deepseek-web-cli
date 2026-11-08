@@ -3,3 +3,6 @@
 
 # HAR captures contain bearer tokens and session cookies
 *.har
+
+# Local cargo cache created by builds
+.cargo/

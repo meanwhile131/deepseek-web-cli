@@ -292,16 +292,36 @@ pub struct RetryPolicy {
     pub cap: Duration,
     /// Minimum spacing between consecutive requests (client-side pacing).
     pub min_gap: Duration,
+    /// Hard cap on consecutive retries of one request before giving up.
+    ///
+    /// Retrying forever is what a bot-detection system sees as abusive
+    /// traffic: the client keeps hammering an endpoint the server has already
+    /// answered with a throttle. A finite cap turns a persistent throttle into
+    /// a visible error the user can act on, instead of an invisible hammer.
+    /// `0` means unlimited (opt-in, via `DS_MAX_RETRIES=0`).
+    pub max_attempts: u32,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            // Patient by default: throttling is normal and worth waiting out.
-            base: Duration::from_millis(500),
+            // Start gently and grow: throttling is normal and worth waiting
+            // out, but only for a bounded number of attempts.
+            base: Duration::from_secs(1),
             cap: Duration::from_secs(60),
-            min_gap: Duration::ZERO,
+            // Never fire requests back-to-back by default. Zero-gap bursts are
+            // indistinguishable from automation, which is exactly what gets an
+            // account flagged for botting.
+            min_gap: Duration::from_millis(1500),
+            max_attempts: 8,
         }
+    }
+}
+
+impl RetryPolicy {
+    /// True once `attempt` retries have been spent and the caller must fail.
+    fn exhausted(&self, attempt: u32) -> bool {
+        self.max_attempts != 0 && attempt >= self.max_attempts
     }
 }
 
@@ -359,6 +379,12 @@ async fn post_json(
             let v: Value = serde_json::from_str(&text)
                 .with_context(|| format!("{label}: invalid JSON response"))?;
             if envelope_rate_limited(&v) {
+                if policy.exhausted(attempt) {
+                    bail!(
+                        "{label}: still throttled after {} attempts; giving up instead of retrying forever (raise DS_MAX_RETRIES to wait longer)",
+                        attempt + 1
+                    );
+                }
                 eprintln!(
                     "[rate-limit] {label}: throttled in response body, waiting {:?} before retry {}",
                     wait,
@@ -383,6 +409,12 @@ async fn post_json(
             );
         }
 
+        if policy.exhausted(attempt) {
+            bail!(
+                "{label}: still failing after {} attempts (last: {status}); giving up instead of retrying forever",
+                attempt + 1
+            );
+        }
         eprintln!(
             "[rate-limit] {label}: {status}, retry {} in {:?}",
             attempt + 1,
@@ -427,6 +459,12 @@ async fn get_json(
             let v: Value = serde_json::from_str(&text)
                 .with_context(|| format!("{label}: invalid JSON response"))?;
             if envelope_rate_limited(&v) {
+                if policy.exhausted(attempt) {
+                    bail!(
+                        "{label}: still throttled after {} attempts; giving up instead of retrying forever (raise DS_MAX_RETRIES to wait longer)",
+                        attempt + 1
+                    );
+                }
                 eprintln!(
                     "[rate-limit] {label}: throttled in response body, waiting {:?} before retry {}",
                     wait,
@@ -451,6 +489,12 @@ async fn get_json(
             );
         }
 
+        if policy.exhausted(attempt) {
+            bail!(
+                "{label}: still failing after {} attempts (last: {status}); giving up instead of retrying forever",
+                attempt + 1
+            );
+        }
         eprintln!(
             "[rate-limit] {label}: {status}, retry {} in {:?}",
             attempt + 1,
@@ -548,6 +592,12 @@ async fn open_completion(
             );
         }
 
+        if policy.exhausted(attempt) {
+            bail!(
+                "completion: still failing after {} attempts (last: {status}); giving up rather than hammering the endpoint",
+                attempt + 1
+            );
+        }
         eprintln!(
             "[rate-limit] completion: {} ({}), waiting {:?} before retry {}",
             status,
@@ -559,7 +609,9 @@ async fn open_completion(
             wait,
             attempt + 1
         );
-        tokio::time::sleep(wait).await;
+        if sleep_or_cancel(wait, cancel).await {
+            bail!("completion: cancelled");
+        }
         attempt += 1;
     }
 }
@@ -1132,6 +1184,13 @@ impl DeepSeekClient {
                 // produced nothing at all, wait and start over rather than
                 // reporting a spurious empty response.
                 if retry_wait.is_some() || !progressed {
+                    if policy.exhausted(attempt) {
+                        yield Err(anyhow::anyhow!(
+                            "completion: no usable output after {} attempts; giving up rather than re-opening the stream forever",
+                            attempt + 1
+                        ));
+                        return;
+                    }
                     let wait = retry_wait
                         .unwrap_or_else(|| backoff(attempt, policy.base, policy.cap));
                     eprintln!(
@@ -1164,6 +1223,24 @@ impl DeepSeekClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_policy_is_bounded_by_default() {
+        let p = RetryPolicy::default();
+        assert!(p.max_attempts > 0, "default policy must not retry forever");
+        assert!(!p.min_gap.is_zero(), "default policy must pace requests");
+        assert!(!p.exhausted(0));
+        assert!(p.exhausted(p.max_attempts));
+    }
+
+    #[test]
+    fn unlimited_retries_is_explicit_opt_in() {
+        let p = RetryPolicy {
+            max_attempts: 0,
+            ..RetryPolicy::default()
+        };
+        assert!(!p.exhausted(1_000_000));
+    }
 
     #[test]
     fn detects_429_envelope() {

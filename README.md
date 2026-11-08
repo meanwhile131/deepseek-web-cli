@@ -35,6 +35,15 @@ How it works: after a sign-in the web app keeps the bearer token in the
 browser's local storage under `userToken`, which is exactly the value the API
 expects. The CLI reads that entry from the local profile - **read-only, from a
 copy**, so a running browser is never disturbed and nothing is written back.
+
+> **This is your browser session, not a separate API key.** The harvested
+> token is the credential the web app is already using. Replaying it from the
+> CLI means two clients share one session, and a session can only have one
+> live token at a time: when the server rotates it for one client, the other
+> is signed out. If you need the CLI and the browser at the same time, that is
+> the trade-off - the CLI no longer papers over it by silently re-harvesting
+> the token, which made the logouts worse (each re-read rotated the session
+> again). A rejected token now fails once with an explanation instead.
 Firefox (`storage/default/https+++chat.deepseek.com/ls/data.sqlite`) and
 Chromium-family browsers (Chrome, Chromium, Edge, Brave, Vivaldi; the
 `Local Storage/leveldb` database) are supported, including Snap/Flatpak paths
@@ -57,9 +66,10 @@ header is sent at all. The tool keeps no cookie jar of its own, so it can never
 replay a cookie the user did not configure.
 
 At startup the token is verified against `users/current`. If it has been
-revoked or has expired, the tool starts another browser sign-in instead of
-failing; after three rejected attempts it gives up and says where the secrets
-file lives.
+revoked or has expired the tool **stops** and tells you where the secrets file
+is; it does not loop through browser sign-ins. Re-harvesting a rejected token
+rotates the shared session and signs you out of the browser, so signing in
+again is something you ask for explicitly (`deepseek --login` or `/login`).
 
 Credentials are read from the environment first, then from a user-wide secrets
 file:
@@ -103,9 +113,17 @@ prompt; at the prompt it just clears the line.
 | `DS_SHELL_TIMEOUT_SECS` | `120` | default per-command timeout |
 | `DS_SHELL_MAX_OUTPUT_BYTES` | `16384` | cap kept per output stream |
 | `DS_HTTP_TIMEOUT_MS` | `180000` | overall HTTP request timeout |
-| `DS_RETRY_BASE_MS` | `500` | first retry backoff step |
+| `DS_RETRY_BASE_MS` | `1000` | first retry backoff step |
 | `DS_RETRY_CAP_MS` | `60000` | backoff ceiling |
-| `DS_MIN_GAP_MS` | `0` | minimum spacing between requests |
+| `DS_MIN_GAP_MS` | `1500` | minimum spacing between requests |
+| `DS_MAX_RETRIES` | `8` | retries per request before giving up (`0` = unlimited) |
+| `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
+| `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
+
+Requests are paced and retries are bounded by default. A client that retries
+forever with no spacing looks like a scraper to abuse detection; if you raise
+these limits, raise the spacing with them rather than setting
+`DS_MIN_GAP_MS=0`.
 | `DS_GOALS_FILE` | XDG data dir | where per-conversation goals live |
 | `DS_SECRETS_FILE` | XDG config dir | where credentials are read from and saved |
 | `DS_DEBUG_PENDING` | `0` | dump model output and extracted commands |
