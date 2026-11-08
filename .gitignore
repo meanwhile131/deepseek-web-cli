@@ -6,3 +6,6 @@
 
 # Local cargo cache created by builds
 .cargo/
+
+# scratch dirs used when testing cargo-binstall locally
+.binstall-test/

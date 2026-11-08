@@ -7,8 +7,31 @@ inside a sandbox rooted at the directory the CLI was started in.
 
 ## Install
 
+Prebuilt binaries are attached to every [release], one archive per target
+(`deepseek-<target>.tar.gz` on unix, `deepseek-<target>.zip` on Windows), each
+containing the bare `deepseek` binary. If you have
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) installed, it
+picks those up straight from the release page:
+
+    cargo binstall deepseek-web-cli
+
+(After a published release; until then, point it at the checkout with
+`cargo binstall --manifest-path . deepseek-web-cli`.)
+
+Otherwise build from source:
+
     cargo build --release
     install -m755 target/release/deepseek ~/.local/bin/deepseek
+
+[release]: https://github.com/meanwhile131/deepseek-web-cli/releases
+
+Every push to `main` also refreshes a rolling [latest build][latest] release
+(pre-release tagged `latest`) whose assets are replaced on each commit, so you
+can always grab a binary built from the newest code:
+
+    gh release download latest --repo meanwhile131/deepseek-web-cli --pattern '*linux-gnu.tar.gz'
+
+[latest]: https://github.com/meanwhile131/deepseek-web-cli/releases/tag/latest
 
 ## Usage
 

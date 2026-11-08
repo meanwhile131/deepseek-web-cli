@@ -2,6 +2,7 @@
 name = "deepseek-web-cli"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/meanwhile131/deepseek-web-cli"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -23,6 +24,23 @@ rusty-leveldb = "4.0.2"
 [[bin]]
 name = "deepseek"
 path = "src/main.rs"
+
+# cargo-binstall metadata: lets `cargo binstall deepseek-web-cli` fetch the
+# prebuilt archive from the GitHub release instead of compiling from source.
+# The release workflow publishes assets named
+#   deepseek-<target>.tar.gz   (unix)
+#   deepseek-<target>.zip      (windows)
+# each containing the bare `deepseek` binary at the archive root, under a tag
+# named `v<version>`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
 
 [profile.release]
 lto = true
