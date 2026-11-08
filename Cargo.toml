@@ -30,15 +30,18 @@ path = "src/main.rs"
 # The release workflow publishes assets named
 #   deepseek-<target>.tar.gz   (unix)
 #   deepseek-<target>.zip      (windows)
-# each containing the bare `deepseek` binary at the archive root, under a tag
-# named `v<version>`.
+# each containing the bare `deepseek` binary at the archive root. Every commit
+# to main publishes a new `build-<sha>` release, marked Latest.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+# Resolve through GitHub's `releases/latest` alias rather than the version tag:
+# every commit publishes a `build-<sha>` release and the newest one is marked
+# Latest, so this always fetches the binaries built from the newest commit.
+pkg-url = "{ repo }/releases/latest/download/{ name }-{ target }.tar.gz"
 pkg-fmt = "tgz"
 bin-dir = "{ bin }{ binary-ext }"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-url = "{ repo }/releases/latest/download/{ name }-{ target }.zip"
 pkg-fmt = "zip"
 bin-dir = "{ bin }{ binary-ext }"
 

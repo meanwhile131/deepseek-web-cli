@@ -135,10 +135,13 @@ jobs:
                 gh release delete "$old_tag" --yes --cleanup-tag
               done
 
-      # Versioned release for v* tags; matches package.metadata.binstall.
+      # Versioned release for v* tags. `make_latest: false` keeps the "Latest"
+      # marker on the per-commit build release, which is what
+      # package.metadata.binstall resolves against.
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           generate_release_notes: true
+          make_latest: false

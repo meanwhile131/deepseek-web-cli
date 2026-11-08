@@ -39,8 +39,10 @@ Or download a specific commit's build:
 
     gh release download build-<sha> --repo meanwhile131/deepseek-web-cli
 
-Version tags (`v*`) still publish their own release, which is what
-`cargo binstall` resolves against.
+`cargo binstall deepseek-web-cli` reads the `package.metadata.binstall` block
+in `Cargo.toml`, which points at GitHub's `releases/latest/download/...` alias,
+so it always installs the newest build. Version tags (`v*`) still publish their
+own release, but they do not take over the "Latest" marker.
 
 ## Usage
 
