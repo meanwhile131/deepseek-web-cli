@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use color::paint;
 use futures_util::StreamExt;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{Config, DefaultEditor};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::sync::watch;
@@ -227,6 +227,44 @@ fn user_secrets_path() -> Option<PathBuf> {
         }
     }
     home_dir().map(|h| h.join(".config").join("deepseek-web-cli").join(".env"))
+}
+
+/// Path to the persistent prompt-history file.
+///
+/// Up/down at the prompt cycle through the lines typed in earlier sessions,
+/// stored here. Lookup order:
+///   1. `$DS_HISTORY_FILE` (explicit override)
+///   2. `$XDG_CONFIG_HOME/deepseek-web-cli/history`
+///   3. `~/.config/deepseek-web-cli/history`
+///
+/// Returns `None` when no home/config directory is known; history then simply
+/// lives in memory for the session.
+fn history_path() -> Option<PathBuf> {
+    resolve_history_path(
+        std::env::var_os("DS_HISTORY_FILE"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        home_dir(),
+    )
+}
+
+/// Pure lookup behind [`history_path`], split out so it can be tested without
+/// touching the process environment.
+fn resolve_history_path(
+    override_file: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(p) = override_file {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Some(dir) = xdg_config_home {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join("deepseek-web-cli").join("history"));
+        }
+    }
+    home.map(|h| h.join(".config").join("deepseek-web-cli").join("history"))
 }
 
 /// Parse the contents of a secrets file: one `KEY=VALUE` per line.  Blank
@@ -1133,7 +1171,28 @@ async fn main() -> Result<()> {
     // Conversations loaded from the server, reusable across /sessions calls.
     let mut session_cache = SessionCache::default();
 
-    let mut rl = DefaultEditor::new()?;
+    // Prompt history: remember what was typed (including slash commands) and
+    // make it reachable with the up/down arrow keys, across runs too.
+    let history_file = history_path();
+    let rl_config = Config::builder()
+        .max_history_size(1000)?
+        .history_ignore_space(true)
+        .history_ignore_dups(true)?
+        .auto_add_history(false)
+        .build();
+    let mut rl = DefaultEditor::with_config(rl_config)?;
+    if let Some(path) = &history_file {
+        match rl.load_history(path) {
+            Ok(()) => {}
+            // No history yet is the normal first-run case, not an error.
+            Err(ReadlineError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "{} could not read history from {}: {e}",
+                paint("1;33", "[warn]"),
+                path.display()
+            ),
+        }
+    }
 
     println!("{}", paint("1;36", "DeepSeek Web CLI \u{2014} multi-turn"));
     println!("  {}   new conversation", paint("32", "/new"));
@@ -1160,6 +1219,10 @@ async fn main() -> Result<()> {
         "  {} Ctrl+C cancels the current reply/command (or clears the prompt)",
         paint("2", "tip:")
     );
+    println!(
+        "  {} up/down recall earlier prompts and commands",
+        paint("2", "tip:")
+    );
     println!();
 
     loop {
@@ -1168,6 +1231,16 @@ async fn main() -> Result<()> {
         client.set_cancel(interrupt.subscribe());
         let prompt = paint("1;35", ">> ");
         let line = rl.readline(&prompt);
+        // Remember the line so up/down can recall it, but keep blank input and
+        // whitespace-led secrets (already excluded by `history_ignore_space`)
+        // out of the history file.
+        if let Ok(input) = &line {
+            if !input.trim().is_empty() {
+                if let Err(e) = rl.add_history_entry(input.as_str()) {
+                    eprintln!("{} could not record history: {e}", paint("1;33", "[warn]"));
+                }
+            }
+        }
         match line {
             Ok(input) if input.trim() == "exit" => break,
             Ok(input) if input.trim() == "/new" => {
@@ -1492,6 +1565,26 @@ async fn main() -> Result<()> {
             Err(e) => eprintln!("{} readline error: {e}", paint("1;31", "[error]")),
         }
     }
+
+    // Persist the session's history so the next run can recall it.
+    if let Some(path) = &history_file {
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!(
+                    "{} could not create history directory {}: {e}",
+                    paint("1;33", "[warn]"),
+                    dir.display()
+                );
+            }
+        }
+        if let Err(e) = rl.save_history(path) {
+            eprintln!(
+                "{} could not save history to {}: {e}",
+                paint("1;33", "[warn]"),
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1630,6 +1723,84 @@ mod tests {
         );
         // The cursor for the next page is the oldest row loaded.
         assert_eq!(c.entries.last().unwrap().id, "d");
+    }
+
+    #[test]
+    fn history_round_trips_through_a_file() {
+        // The same builder/config the prompt loop uses: entries added during a
+        // session survive a save/reload cycle, so up/down works across runs.
+        use rustyline::{Config, DefaultEditor};
+
+        let dir = std::env::temp_dir().join(format!("ds-hist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+
+        let config = Config::builder()
+            .max_history_size(1000)
+            .unwrap()
+            .history_ignore_space(true)
+            .history_ignore_dups(true)
+            .unwrap()
+            .auto_add_history(false)
+            .build();
+        let mut rl = DefaultEditor::with_config(config).unwrap();
+        // A missing file on first run is not an error.
+        assert!(rl.load_history(&path).is_err());
+        rl.add_history_entry("hello").unwrap();
+        rl.add_history_entry("hello").unwrap(); // consecutive dup dropped
+        rl.add_history_entry("/goal ship it").unwrap();
+        rl.add_history_entry(" secret").unwrap(); // leading space dropped
+        rl.save_history(&path).unwrap();
+
+        let mut rl2 = DefaultEditor::with_config(
+            Config::builder()
+                .max_history_size(1000)
+                .unwrap()
+                .history_ignore_space(true)
+                .history_ignore_dups(true)
+                .unwrap()
+                .auto_add_history(false)
+                .build(),
+        )
+        .unwrap();
+        rl2.load_history(&path).unwrap();
+        let entries: Vec<String> = rl2.history().iter().map(|e| e.to_string()).collect();
+        assert_eq!(
+            entries,
+            vec!["hello".to_string(), "/goal ship it".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_path_prefers_explicit_override() {
+        use super::resolve_history_path;
+        use std::ffi::OsString;
+
+        // $DS_HISTORY_FILE wins over everything else.
+        assert_eq!(
+            resolve_history_path(
+                Some(OsString::from("/tmp/h")),
+                Some(OsString::from("/xdg")),
+                Some("/home/u".into()),
+            ),
+            Some("/tmp/h".into())
+        );
+        // An empty override falls through to the XDG config dir.
+        assert_eq!(
+            resolve_history_path(
+                Some(OsString::new()),
+                Some(OsString::from("/xdg")),
+                Some("/home/u".into()),
+            ),
+            Some("/xdg/deepseek-web-cli/history".into())
+        );
+        // Without either, the home config dir is used.
+        assert_eq!(
+            resolve_history_path(None, None, Some("/home/u".into())),
+            Some("/home/u/.config/deepseek-web-cli/history".into())
+        );
+        assert_eq!(resolve_history_path(None, None, None), None);
     }
 
     fn parse(v: &[&str]) -> ParsedArgs {

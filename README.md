@@ -104,6 +104,12 @@ previous `AUTHORIZATION_TOKEN` line and leaving the rest of the file untouched.
 Ctrl+C cancels the current reply, command, or retry backoff and returns to the
 prompt; at the prompt it just clears the line.
 
+Up/down at the prompt cycle through previously entered lines - both ordinary
+messages and slash commands - from this and earlier runs. History is kept in
+`~/.config/deepseek-web-cli/history` (or `$DS_HISTORY_FILE`), capped at 1000
+entries with consecutive duplicates and blank lines dropped. Prefix a line with
+a space to keep it out of the history.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -126,6 +132,7 @@ these limits, raise the spacing with them rather than setting
 `DS_MIN_GAP_MS=0`.
 | `DS_GOALS_FILE` | XDG data dir | where per-conversation goals live |
 | `DS_SECRETS_FILE` | XDG config dir | where credentials are read from and saved |
+| `DS_HISTORY_FILE` | XDG config dir | where prompt history is read from and saved |
 | `DS_DEBUG_PENDING` | `0` | dump model output and extracted commands |
 | `DS_DEBUG_SECRETS` | `0` | report which secrets file was loaded |
 | `NO_COLOR` / `CLICOLOR_FORCE` | - | follow https://no-color.org |
