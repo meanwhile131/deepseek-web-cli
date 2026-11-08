@@ -157,11 +157,9 @@ When a reply is cut short mid-generation (a `generation_err` toast, or the
 connection dropping after some output), the CLI resumes it **automatically** by
 posting to `chat/continue` itself - no need to type `/continue`, and no new
 completion is charged. The partial text stays on screen and streaming picks up
-where it stopped. Each cut-short reply is resumed at most `DS_MAX_AUTO_CONTINUES`
-times (default 5) so a server that keeps truncating cannot loop forever; once
-that budget is spent the truncation is reported and `/continue` remains
-available to try again by hand. `/continue` is still useful when you come back
-to a conversation whose reply was interrupted in an earlier session.
+where it stopped. Resuming is unlimited: a truncated reply keeps being resumed
+until it completes (Ctrl+C interrupts it). `/continue` is still useful when you
+come back to a conversation whose reply was interrupted in an earlier session.
 
 Ctrl+C cancels the current reply, command, or retry backoff and returns to the
 prompt; at the prompt it just clears the line.
@@ -187,7 +185,6 @@ a space to keep it out of the history.
 | `DS_MAX_RETRIES` | `0` | retries per request before giving up (`0` = unlimited, the default) |
 | `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
 | `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
-| `DS_MAX_AUTO_CONTINUES` | `5` | how many times a cut-short reply is resumed with `chat/continue` automatically (`0` disables) |
 | `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |
 
 Requests are paced and retries back off exponentially (base x4 per attempt,

@@ -35,13 +35,6 @@ const GOAL_DONE: &str = "[GOAL COMPLETE]";
 /// again, or raised with `DS_MAX_GOAL_TURNS`.
 const DEFAULT_MAX_GOAL_TURNS: usize = 25;
 
-/// Hard cap on automatic `/continue` resumes for one cut-short reply.
-///
-/// Each resume costs one `chat/continue` request, so a server that truncates
-/// every stream would otherwise loop forever. Override with
-/// `DS_MAX_AUTO_CONTINUES`; `0` disables automatic resuming entirely.
-const DEFAULT_MAX_AUTO_CONTINUES: usize = 5;
-
 /// Hard cap on shell round-trips inside a single turn.
 ///
 /// Every iteration sends one more completion request, so an unproductive
@@ -650,17 +643,15 @@ enum ReplySource<'a> {
 /// A reply the server cuts short mid-generation is resumed automatically: the
 /// stream reports a [`api::Truncated`] error after the partial text has been
 /// rendered and the conversation tip recorded, so the very endpoint `/continue`
-/// drives is re-opened without the user having to type it. That is bounded by
-/// `DS_MAX_AUTO_CONTINUES` (default [`DEFAULT_MAX_AUTO_CONTINUES`]) so a server
-/// that keeps truncating cannot spin the turn forever; once the budget is
-/// spent the truncation is reported as before, pointing at `/continue`.
+/// drives is re-opened without the user having to type it. There is no cap on
+/// these resumes: a truncated reply keeps being resumed until it completes or
+/// the user interrupts with Ctrl+C.
 async fn stream_reply(
     client: &mut api::DeepSeekClient,
     source: ReplySource<'_>,
     thinking: bool,
     search: bool,
 ) -> Result<(String, String)> {
-    let max_resumes = env_u64("DS_MAX_AUTO_CONTINUES", DEFAULT_MAX_AUTO_CONTINUES as u64) as usize;
     let mut resumes = 0usize;
     let mut source = source;
     // Text from earlier, cut-short attempts is kept so command extraction sees
@@ -676,33 +667,17 @@ async fn stream_reply(
         };
         // Only a mid-generation cut is resumable; anything else (auth, bad
         // request, exhausted retries) belongs to the caller.
-        if !should_auto_resume(api::is_truncated(&err), resumes, max_resumes) {
-            if api::is_truncated(&err) {
-                return Err(err.context(format!(
-                    "still truncated after {resumes} automatic /continue attempt(s); \
-                     run /continue to resume message generation"
-                )));
-            }
+        if !api::is_truncated(&err) {
             return Err(err);
         }
         resumes += 1;
         println!(
-            "{} {} - resuming automatically ({}/{max_resumes})",
+            "{} {} - resuming automatically (attempt {resumes})",
             paint("1;33", "[cut short]"),
             format_args!("{err}"),
-            resumes
         );
         source = ReplySource::Continue;
     }
-}
-
-/// Whether a failed streaming attempt should be resumed with `chat/continue`
-/// instead of surfacing the error.
-///
-/// Only a mid-generation cut is resumable, and only while the per-reply budget
-/// (`DS_MAX_AUTO_CONTINUES`) is unspent.
-fn should_auto_resume(truncated: bool, resumes: usize, max: usize) -> bool {
-    truncated && resumes < max
 }
 
 /// One streaming attempt. Returns the text rendered so far plus the error, if
@@ -1737,22 +1712,10 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        goal_completed, parse_args, parse_goal_command, parse_secrets, should_auto_resume,
-        with_goal, GoalCommand, ParsedArgs, SessionCache,
+        goal_completed, parse_args, parse_goal_command, parse_secrets, with_goal, GoalCommand,
+        ParsedArgs, SessionCache,
     };
     use crate::sessions;
-
-    #[test]
-    fn auto_resume_only_for_truncation_within_budget() {
-        // Cut-short replies resume while the budget lasts...
-        assert!(should_auto_resume(true, 0, 5));
-        assert!(should_auto_resume(true, 4, 5));
-        // ...but not once it is spent, and never for unrelated errors.
-        assert!(!should_auto_resume(true, 5, 5));
-        assert!(!should_auto_resume(false, 0, 5));
-        // A budget of zero disables automatic resuming entirely.
-        assert!(!should_auto_resume(true, 0, 0));
-    }
 
     #[test]
     fn no_goal_is_passthrough() {
