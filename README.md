@@ -25,9 +25,10 @@ Otherwise build from source:
 
 [release]: https://github.com/meanwhile131/deepseek-web-cli/releases
 
-Every push to `main` also refreshes a rolling [latest build][latest] release
-(pre-release tagged `latest`) whose assets are replaced on each commit, so you
-can always grab a binary built from the newest code:
+Every push to `main` also refreshes a rolling [latest build][latest] release —
+a full release tagged `latest`, refreshed and marked as the repository's
+"Latest" on each commit, with its assets replaced and its tag force-moved to
+the new commit, so you can always grab a binary built from the newest code:
 
     gh release download latest --repo meanwhile131/deepseek-web-cli --pattern '*linux-gnu.tar.gz'
 
