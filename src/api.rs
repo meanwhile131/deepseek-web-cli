@@ -16,6 +16,14 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
 type Slot = Arc<Mutex<Option<Instant>>>;
 
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
+/// `target_path` the completion PoW challenge is issued for.
+const COMPLETION_TARGET_PATH: &str = "/api/v0/chat/completion";
+/// Resume generation of an interrupted assistant message.
+///
+/// Unlike `chat/completion` this endpoint needs no proof of work: the web
+/// client posts it with a plain bearer token (see the captured HAR), so it is
+/// opened through the same streaming/retry path but without a PoW header.
+const CONTINUE_URL: &str = "https://chat.deepseek.com/api/v0/chat/continue";
 const CHALLENGE_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 const SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
 const SESSION_PAGE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/fetch_page";
@@ -520,6 +528,7 @@ async fn fetch_challenge(
     policy: &RetryPolicy,
     slot: &Slot,
     cancel: &mut Option<watch::Receiver<u64>>,
+    target_path: &str,
 ) -> Result<ChatChallenge> {
     let raw = post_json(
         http,
@@ -527,7 +536,7 @@ async fn fetch_challenge(
         slot,
         cancel,
         CHALLENGE_URL,
-        &json!({ "target_path": "/api/v0/chat/completion" }),
+        &json!({ "target_path": target_path }),
         "create_pow_challenge",
     )
     .await?;
@@ -535,36 +544,56 @@ async fn fetch_challenge(
     Ok(c)
 }
 
-/// Open a completion stream, retrying throttled/transient responses.
+/// Which streaming endpoint a request goes to, and how to authenticate it.
+#[derive(Clone, Copy)]
+struct StreamTarget {
+    url: &'static str,
+    /// Whether a proof-of-work header must be solved and attached.
+    pow: bool,
+    /// Short name used in retry/error messages, e.g. `completion`.
+    label: &'static str,
+}
+
+/// Open a chat stream, retrying throttled/transient responses.
 ///
 /// A throttle does not always use a 4xx status: the server may answer `200 OK`
 /// with a JSON error envelope. We inspect non-SSE bodies explicitly so those
 /// never get mistaken for an empty reply.
-async fn open_completion(
+///
+/// `pow` selects the authentication style: `chat/completion` requires a solved
+/// proof-of-work header, while `chat/continue` (like every other endpoint)
+/// only needs the bearer token - the captured HAR shows the browser posting it
+/// with no `x-ds-pow-response` at all.
+async fn open_stream(
     http: &Client,
     policy: &RetryPolicy,
     slot: &Slot,
     cancel: &mut Option<watch::Receiver<u64>>,
     body: &Value,
+    target: StreamTarget,
 ) -> Result<Response> {
+    let StreamTarget { url, pow, label } = target;
     let mut attempt = 0u32;
     loop {
         pace(slot, policy.min_gap).await;
 
-        let challenge = fetch_challenge(http, policy, slot, cancel).await?;
-        let answer = challenge
-            .solve()
-            .ok_or_else(|| anyhow::anyhow!("PoW solving failed"))?;
-        let solved: SolvedChallenge = challenge.to_solved(answer);
-        let pow_b64 = STANDARD.encode(serde_json::to_string(&solved)?);
+        let mut req = http.post(url);
+        if pow {
+            let challenge =
+                fetch_challenge(http, policy, slot, cancel, COMPLETION_TARGET_PATH).await?;
+            let answer = challenge
+                .solve()
+                .ok_or_else(|| anyhow::anyhow!("PoW solving failed"))?;
+            let solved: SolvedChallenge = challenge.to_solved(answer);
+            let pow_b64 = STANDARD.encode(serde_json::to_string(&solved)?);
+            req = req.header("x-ds-pow-response", pow_b64);
+        }
 
-        let resp = http
-            .post(COMPLETION_URL)
-            .header("x-ds-pow-response", pow_b64)
+        let resp = req
             .json(body)
             .send()
             .await
-            .context("completion: request failed")?;
+            .with_context(|| format!("{label}: request failed"))?;
 
         let status = resp.status();
         let content_type = resp
@@ -593,7 +622,7 @@ async fn open_completion(
         let retryable = is_retryable(status) || rate_limited;
         if !retryable {
             bail!(
-                "completion failed after {} attempt(s): {} - {}",
+                "{label} failed after {} attempt(s): {} - {}",
                 attempt + 1,
                 status,
                 text
@@ -602,12 +631,12 @@ async fn open_completion(
 
         if policy.exhausted(attempt) {
             bail!(
-                "completion: still failing after {} attempts (last: {status}); giving up rather than hammering the endpoint",
+                "{label}: still failing after {} attempts (last: {status}); giving up rather than hammering the endpoint",
                 attempt + 1
             );
         }
         eprintln!(
-            "[rate-limit] completion: {} ({}), waiting {:?} before retry {}",
+            "[rate-limit] {label}: {} ({}), waiting {:?} before retry {}",
             status,
             if rate_limited {
                 "rate limited"
@@ -618,7 +647,7 @@ async fn open_completion(
             attempt + 1
         );
         if sleep_or_cancel(wait, cancel).await {
-            bail!("completion: cancelled");
+            bail!("{label}: cancelled");
         }
         attempt += 1;
     }
@@ -661,6 +690,26 @@ fn build_http(headers: header::HeaderMap, timeout: Option<Duration>) -> Result<C
              (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
         .build()?)
+}
+
+/// Request body for `chat/continue`, mirroring the captured HAR:
+/// `{"chat_session_id", "message_id", "fallback_to_resume": true}` plus the
+/// optional web-client `shumei_device_id` blob.
+///
+/// `message_id` is the interrupted *assistant* message - the same id the SSE
+/// stream reports as `response/message_id`, which the client stores as the
+/// conversation tip. `fallback_to_resume` lets the server restart the message
+/// from scratch when it cannot literally resume it.
+fn continue_body(session_id: &str, message_id: &Value, shumei_device_id: Option<&str>) -> Value {
+    let mut body = json!({
+        "chat_session_id": session_id,
+        "message_id": message_id,
+        "fallback_to_resume": true,
+    });
+    if let Some(device) = shumei_device_id {
+        body["shumei_device_id"] = Value::String(device.to_string());
+    }
+    body
 }
 
 pub struct DeepSeekClient {
@@ -918,6 +967,7 @@ impl DeepSeekClient {
         Ok(self.chat_session_id.as_ref().unwrap())
     }
 
+    /// Start a new assistant reply to `message`.
     pub async fn send_message(
         &mut self,
         message: &str,
@@ -933,7 +983,7 @@ impl DeepSeekClient {
             .unwrap_or(Value::Null);
 
         // Completion request with conversation threading. PoW is solved inside
-        // `open_completion`, once per attempt, so throttled retries stay valid.
+        // `open_stream`, once per attempt, so throttled retries stay valid.
         let body = json!({
             "chat_session_id": session_id,
             "parent_message_id": parent_json,
@@ -947,6 +997,68 @@ impl DeepSeekClient {
             "stream": true,
         });
 
+        self.open_chat_stream(
+            body,
+            StreamTarget {
+                url: COMPLETION_URL,
+                pow: true,
+                label: "completion",
+            },
+        )
+    }
+
+    /// Resume generation of the current assistant message.
+    ///
+    /// `chat/continue` is what the web app posts when a reply was cut short -
+    /// by a network drop, a closed tab, or a `generation_err` toast - instead
+    /// of paying for a whole new completion. It takes the conversation id and
+    /// the id of the interrupted *assistant* message (the tip), and answers
+    /// with the same SSE event stream as `chat/completion`.
+    ///
+    /// Unlike completion it needs no proof of work: the captured request is a
+    /// plain `POST` with the bearer token and the JSON body
+    /// `{"chat_session_id", "message_id", "fallback_to_resume"}`. The web
+    /// client also sends a `shumei_device_id` blob; it is optional here and is
+    /// forwarded only when the caller sets `DS_SHUMEI_DEVICE_ID`.
+    ///
+    /// Returns an error when there is no assistant message to resume, since
+    /// the endpoint has nothing to continue without one.
+    pub async fn continue_message(&mut self) -> Result<ChatStream> {
+        let session_id = match self.chat_session_id.clone() {
+            Some(id) => id,
+            None => bail!("continue: no conversation yet - send a message first"),
+        };
+        let message_id = self
+            .last_message_id
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "continue: no assistant message id to resume - send a message first"
+                )
+            })?;
+
+        let device = std::env::var("DS_SHUMEI_DEVICE_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let body = continue_body(&session_id, &message_id, device.as_deref());
+
+        self.open_chat_stream(
+            body,
+            StreamTarget {
+                url: CONTINUE_URL,
+                pow: false,
+                label: "continue",
+            },
+        )
+    }
+
+    /// Shared SSE plumbing for `chat/completion` and `chat/continue`.
+    fn open_chat_stream(&self, body: Value, target: StreamTarget) -> Result<ChatStream> {
+        let StreamTarget { label, .. } = target;
         let http = self.http.clone();
         let policy = self.policy;
         let mut cancel = self.cancel.clone();
@@ -981,7 +1093,7 @@ impl DeepSeekClient {
             }
 
             'retry: loop {
-                let resp = match open_completion(&http, &policy, &slot, &mut cancel, &body).await {
+                let resp = match open_stream(&http, &policy, &slot, &mut cancel, &body, target).await {
                     Ok(r) => r,
                     Err(e) => {
                         yield Err(e);
@@ -993,6 +1105,10 @@ impl DeepSeekClient {
                 let mut buffer = String::new();
                 let mut finished = false;
                 let mut retry_wait: Option<Duration> = None;
+                // A `toast` announcing a server-side generation failure (the HAR shows
+                // `chat/continue` ending this way instead of FINISHED). Kept so the
+                // truncated reply is reported rather than silently accepted.
+                let mut generation_error: Option<String> = None;
 
                 while let Some(item) = byte_stream.next().await {
                     match item {
@@ -1022,7 +1138,8 @@ impl DeepSeekClient {
                                                     || evt.get("code").is_some())
                                             {
                                                 yield Err(anyhow::anyhow!(
-                                                    "completion error: {}",
+                                                    "{} error: {}",
+                                                    label,
                                                     line
                                                 ));
                                                 return;
@@ -1061,6 +1178,22 @@ impl DeepSeekClient {
                                         .unwrap_or("stream error");
                                     yield Err(anyhow::anyhow!("stream error: {}", msg));
                                     return;
+                                }
+
+                                // `event: toast` payloads carry no `p`/`v`;
+                                // remember a generation failure for the
+                                // end-of-stream check.
+                                if evt.get("p").is_none()
+                                    && evt.get("finish_reason").and_then(|v| v.as_str())
+                                        == Some("generation_err")
+                                {
+                                    generation_error = Some(
+                                        evt.get("content")
+                                            .and_then(|c| c.as_str())
+                                            .unwrap_or("generation error")
+                                            .to_string(),
+                                    );
+                                    continue;
                                 }
 
                                 let p = evt.get("p").and_then(|v| v.as_str());
@@ -1169,7 +1302,8 @@ impl DeepSeekClient {
                             if !progressed {
                                 retry_wait = Some(backoff(attempt, policy.base, policy.cap));
                                 eprintln!(
-                                    "[rate-limit] completion: stream broke before any output ({}), waiting before retry {}",
+                                    "[rate-limit] {}: stream broke before any output ({}), waiting before retry {}",
+                                    label,
                                     e,
                                     attempt + 1
                                 );
@@ -1194,7 +1328,8 @@ impl DeepSeekClient {
                 if retry_wait.is_some() || !progressed {
                     if policy.exhausted(attempt) {
                         yield Err(anyhow::anyhow!(
-                            "completion: no usable output after {} attempts; giving up rather than re-opening the stream forever (set DS_MAX_RETRIES=0 for no cap)",
+                            "{}: no usable output after {} attempts; giving up rather than re-opening the stream forever (set DS_MAX_RETRIES=0 for no cap)",
+                            label,
                             attempt + 1
                         ));
                         return;
@@ -1202,7 +1337,8 @@ impl DeepSeekClient {
                     let wait = retry_wait
                         .unwrap_or_else(|| backoff(attempt, policy.base, policy.cap));
                     eprintln!(
-                        "[rate-limit] completion: no usable output (attempt {}), waiting {:?} before retry",
+                        "[rate-limit] {}: no usable output (attempt {}), waiting {:?} before retry",
+                        label,
                         attempt + 1,
                         wait
                     );
@@ -1217,10 +1353,21 @@ impl DeepSeekClient {
                     continue 'retry;
                 }
 
-                // We rendered content but never saw FINISHED; accept it.
                 if in_think {
                     yield Ok("\u{27EA}/THINK\u{27EB}".to_string());
                 }
+                // A server-side generation failure ended the stream early.
+                // The partial text already went out, so report the truncation
+                // and point at the endpoint that resumes it rather than
+                // pretending the reply was complete.
+                if let Some(reason) = generation_error.take() {
+                    yield Err(anyhow::anyhow!(
+                        "{label}: reply cut short by the server ({reason}); \
+                         run /continue to resume message generation"
+                    ));
+                    return;
+                }
+                // We rendered content but never saw FINISHED; accept it.
                 return;
             }
         };
@@ -1418,6 +1565,50 @@ mod tests {
         let err = unwrap_biz(v, "users/current").unwrap_err().to_string();
         assert!(err.starts_with("users/current failed:"), "{err}");
         assert!(err.contains("INVALID_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn continue_body_matches_captured_har() {
+        // Shapes taken from chat.deepseek.com_api_v0_chat_continue_*.har:
+        // a plain POST with these keys and no PoW header.
+        let body = continue_body(
+            "eb42960a-9d95-4320-9b6f-91e5143b73cf",
+            &serde_json::json!(38),
+            None,
+        );
+        assert_eq!(
+            body["chat_session_id"],
+            "eb42960a-9d95-4320-9b6f-91e5143b73cf"
+        );
+        assert_eq!(body["message_id"], 38);
+        assert_eq!(body["fallback_to_resume"], true);
+        assert!(
+            body.get("shumei_device_id").is_none(),
+            "optional device blob must not be sent unless configured"
+        );
+        // It is not a completion body: no prompt/parent_message_id keys.
+        assert!(body.get("prompt").is_none());
+        assert!(body.get("parent_message_id").is_none());
+    }
+
+    #[test]
+    fn continue_body_forwards_configured_device_id() {
+        let body = continue_body("s", &serde_json::json!("m-1"), Some("DeyJhcH"));
+        assert_eq!(body["shumei_device_id"], "DeyJhcH");
+        assert_eq!(body["message_id"], "m-1");
+    }
+
+    #[test]
+    fn har_continue_toast_is_retryable_transient() {
+        // The captured continue stream ends with a generation error toast
+        // instead of FINISHED; that must be surfaced, not silently accepted.
+        let evt: Value = serde_json::json!({
+            "type": "error",
+            "content": "Server is temporarily unavailable.",
+            "finish_reason": "generation_err"
+        });
+        assert!(!event_rate_limited(&evt), "not a rate limit");
+        assert!(evt.get("finish_reason").and_then(|v| v.as_str()) == Some("generation_err"));
     }
 
     #[test]

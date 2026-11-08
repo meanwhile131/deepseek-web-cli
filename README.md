@@ -91,6 +91,7 @@ previous `AUTHORIZATION_TOKEN` line and leaving the rest of the file untouched.
 | `/login` | sign in again through the browser (replaces the saved token) |
 | `/logout` | remove the saved token from the secrets file (sign out in the browser too, or the next run re-reads that session) |
 | `/new` | start a fresh conversation (the old one stays resumable) |
+| `/continue` | resume the interrupted reply via `chat/continue` (no new completion charge, no proof of work) |
 | `/id` | show the current conversation tip |
 | `/goal <text>` | set a goal and let the model work until it reports completion |
 | `/goal`, `/goal show`, `/goal status` | show the active goal |
@@ -100,6 +101,25 @@ previous `AUTHORIZATION_TOKEN` line and leaving the rest of the file untouched.
 | `/resume <n|id-prefix>` | continue a saved conversation (restores its goal) |
 | `/label <text>` | rename the current conversation |
 | `/forget <n|id-prefix>` | delete a conversation on the server |
+
+### Resuming a cut-short reply
+
+`chat/completion` is not the only way to get assistant output: when a reply is
+interrupted (network drop, closed tab, or a server-side `generation_err`), the
+web client posts to `chat/continue` with the conversation id and the id of the
+interrupted assistant message instead of paying for a whole new completion.
+`/continue` does the same:
+
+```json
+{"chat_session_id": "<id>", "message_id": 38, "fallback_to_resume": true}
+```
+
+The endpoint returns the same SSE event stream as `chat/completion` and needs
+no proof of work - only the bearer token. The client tracks the assistant
+message id from the stream, so `/continue` resumes whatever reply was last cut
+off in the current conversation. If the server reports a generation error, the
+CLI prints it and suggests `/continue` rather than silently accepting a
+truncated answer.
 
 Ctrl+C cancels the current reply, command, or retry backoff and returns to the
 prompt; at the prompt it just clears the line.
@@ -125,6 +145,7 @@ a space to keep it out of the history.
 | `DS_MAX_RETRIES` | `0` | retries per request before giving up (`0` = unlimited, the default) |
 | `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
 | `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
+| `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |
 
 Requests are paced and retries back off exponentially (base x4 per attempt,
 jittered, up to the ceiling) with no fixed attempt cap by default. A client

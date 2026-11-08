@@ -623,17 +623,32 @@ impl Drop for Renderer {
     }
 }
 
+/// What the first reply of a turn should ask the server for.
+#[derive(Clone, Copy)]
+enum ReplySource<'a> {
+    /// A fresh `chat/completion` for this message.
+    Message(&'a str),
+    /// Resume the current assistant message via `chat/continue`.
+    Continue,
+}
+
 /// Send one message, render the stream, and return both the visible
 /// (non-thinking) text and the reasoning text.  The caller normally extracts
 /// shell commands from the visible text, but falls back to the reasoning text
 /// when the model mistakenly emits the tool call inside its thinking region.
+///
+/// With [`ReplySource::Continue`] the reply is resumed through
+/// `chat/continue` instead of a fresh `chat/completion`.
 async fn stream_reply(
     client: &mut api::DeepSeekClient,
-    msg: &str,
+    source: ReplySource<'_>,
     thinking: bool,
     search: bool,
 ) -> Result<(String, String)> {
-    let mut s = client.send_message(msg, thinking, search).await?;
+    let mut s = match source {
+        ReplySource::Message(message) => client.send_message(message, thinking, search).await?,
+        ReplySource::Continue => client.continue_message().await?,
+    };
     let mut visible = String::new();
     let mut reasoning = String::new();
     let mut renderer = Renderer::new();
@@ -673,7 +688,7 @@ struct TurnConfig<'a> {
 
 async fn run_turn(
     client: &mut api::DeepSeekClient,
-    message: &str,
+    first: ReplySource<'_>,
     cfg: &TurnConfig<'_>,
     interrupt: &Interrupt,
 ) -> Result<TurnResult> {
@@ -684,7 +699,7 @@ async fn run_turn(
     let goal = cfg.goal;
 
     let (mut pending, mut reasoning) = tokio::select! {
-        r = stream_reply(client, message, thinking, search) => r?,
+        r = stream_reply(client, first, thinking, search) => r?,
         _ = rx.changed() => {
             println!("\n{}", paint("1;33", "[interrupted]"));
             return Ok(TurnResult::Interrupted);
@@ -783,7 +798,7 @@ async fn run_turn(
 
         let follow_up = with_goal(goal, &format!("[SHELL OUTPUT]{combined}"));
         let (v, r) = tokio::select! {
-            r = stream_reply(client, &follow_up, thinking, search) => r?,
+            r = stream_reply(client, ReplySource::Message(&follow_up), thinking, search) => r?,
             _ = rx.changed() => {
                 println!("\n{}", paint("1;33", "[interrupted]"));
                 return Ok(TurnResult::Interrupted);
@@ -1200,6 +1215,10 @@ async fn main() -> Result<()> {
     println!("  {}   show conversation tip", paint("33", "/id"));
     println!("  {}   set/start/show/clear goal", paint("35", "/goal"));
     println!(
+        "  {}   resume the interrupted reply",
+        paint("34", "/continue")
+    );
+    println!(
         "  {}   list conversations ({} to page)",
         paint("34", "/sessions"),
         paint("2", "/sessions more")
@@ -1435,6 +1454,47 @@ async fn main() -> Result<()> {
                 }
                 continue;
             }
+            Ok(input) if input.trim() == "/continue" => {
+                // Resume the current (interrupted) assistant reply instead of
+                // paying for a fresh completion. chat/continue threads from the
+                // message id the stream last reported, which `last_message_id`
+                // already tracks.
+                if client.chat_session_id().is_none() || client.last_message_id().is_none() {
+                    println!(
+                        "{} nothing to continue \u{2014} send a message first",
+                        paint("1;33", "[warn]")
+                    );
+                    continue;
+                }
+                println!(
+                    "{} resuming message {}",
+                    paint("36", "[continue]"),
+                    client
+                        .last_message_id()
+                        .map(|v| v.to_string())
+                        .unwrap_or_default()
+                );
+                let cfg = TurnConfig {
+                    thinking,
+                    search,
+                    sandbox_root: sandbox_root.clone(),
+                    debug_pending,
+                    goal: &goal,
+                };
+                match run_turn(&mut client, ReplySource::Continue, &cfg, &interrupt).await {
+                    Ok(TurnResult::Done { completed }) => {
+                        apply_pending_title(&client, &mut label, &mut pending_title).await;
+                        if completed && goal.is_some() {
+                            println!("{}", paint("32", "[goal completed]"));
+                            goal = None;
+                        }
+                        persist_goal(&client, &goal);
+                    }
+                    Ok(TurnResult::Interrupted) => {}
+                    Err(e) => eprintln!("{} {e:#}", paint("1;31", "[error]")),
+                }
+                continue;
+            }
             Ok(input) if input.trim() == "/goal" || input.trim().starts_with("/goal ") => {
                 let arg = input.trim()["/goal".len()..].trim().to_string();
                 match parse_goal_command(&arg) {
@@ -1490,8 +1550,13 @@ async fn main() -> Result<()> {
                                 debug_pending,
                                 goal: &goal,
                             };
-                            let completed = match run_turn(&mut client, &message, &cfg, &interrupt)
-                                .await
+                            let completed = match run_turn(
+                                &mut client,
+                                ReplySource::Message(&message),
+                                &cfg,
+                                &interrupt,
+                            )
+                            .await
                             {
                                 Ok(TurnResult::Done { completed }) => completed,
                                 Ok(TurnResult::Interrupted) => {
@@ -1539,7 +1604,14 @@ async fn main() -> Result<()> {
                     debug_pending,
                     goal: &goal,
                 };
-                match run_turn(&mut client, &message, &cfg, &interrupt).await {
+                match run_turn(
+                    &mut client,
+                    ReplySource::Message(&message),
+                    &cfg,
+                    &interrupt,
+                )
+                .await
+                {
                     Ok(TurnResult::Done { completed }) => {
                         apply_pending_title(&client, &mut label, &mut pending_title).await;
                         if completed && goal.is_some() {
