@@ -114,7 +114,8 @@ jobs:
               --target "$GITHUB_SHA" \
               --title "$title" \
               --notes "$body"
-          gh release edit "$tag" --title "$title" --notes "$body" --prerelease=false
+          gh release edit "$tag" --title "$title" --notes "$body" \
+            --prerelease=false --target "$GITHUB_SHA"
           # Move the rolling tag onto this commit so the release page points at
           # the code the binaries were built from.
           gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/${tag}" \
