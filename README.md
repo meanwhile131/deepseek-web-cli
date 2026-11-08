@@ -119,17 +119,18 @@ a space to keep it out of the history.
 | `DS_SHELL_TIMEOUT_SECS` | `120` | default per-command timeout |
 | `DS_SHELL_MAX_OUTPUT_BYTES` | `16384` | cap kept per output stream |
 | `DS_HTTP_TIMEOUT_MS` | `180000` | overall HTTP request timeout |
-| `DS_RETRY_BASE_MS` | `1000` | first retry backoff step |
-| `DS_RETRY_CAP_MS` | `60000` | backoff ceiling |
+| `DS_RETRY_BASE_MS` | `2000` | first retry backoff step |
+| `DS_RETRY_CAP_MS` | `300000` | backoff ceiling |
 | `DS_MIN_GAP_MS` | `1500` | minimum spacing between requests |
-| `DS_MAX_RETRIES` | `8` | retries per request before giving up (`0` = unlimited) |
+| `DS_MAX_RETRIES` | `0` | retries per request before giving up (`0` = unlimited, the default) |
 | `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
 | `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
 
-Requests are paced and retries are bounded by default. A client that retries
-forever with no spacing looks like a scraper to abuse detection; if you raise
-these limits, raise the spacing with them rather than setting
-`DS_MIN_GAP_MS=0`.
+Requests are paced and retries back off exponentially (base x4 per attempt,
+jittered, up to the ceiling) with no fixed attempt cap by default. A client
+that retries forever with no spacing looks like a scraper to abuse detection;
+the growing wait is what keeps retries polite, so keep `DS_MIN_GAP_MS` above
+zero and raise it rather than setting it to `0`.
 | `DS_GOALS_FILE` | XDG data dir | where per-conversation goals live |
 | `DS_SECRETS_FILE` | XDG config dir | where credentials are read from and saved |
 | `DS_HISTORY_FILE` | XDG config dir | where prompt history is read from and saved |

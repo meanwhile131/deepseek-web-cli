@@ -97,10 +97,16 @@ fn parse_duration_hint(s: &str) -> Option<Duration> {
     matched.then(|| Duration::from_secs_f64(total.max(0.0)))
 }
 
-/// Exponential backoff with jitter: base * 2^attempt, capped, then randomised
+/// How fast the backoff grows per attempt. A factor of four climbs out of a
+/// short throttle quickly (one or two retries) instead of creeping up by
+/// doubling, which used to leave the client hammering for the first handful of
+/// attempts.
+const BACKOFF_FACTOR: u32 = 4;
+
+/// Exponential backoff with jitter: base * 4^attempt, capped, then randomised
 /// into [cap/2, cap] so parallel clients do not retry in lockstep.
 fn backoff(attempt: u32, base: Duration, cap: Duration) -> Duration {
-    let exp = base.saturating_mul(1u32 << attempt.min(16));
+    let exp = base.saturating_mul(BACKOFF_FACTOR.saturating_pow(attempt.min(15)));
     let capped = exp.min(cap);
     let ms = capped.as_millis() as u64;
     if ms == 0 {
@@ -286,7 +292,7 @@ fn retry_after_value(v: &Value) -> Option<Duration> {
 /// Retry knobs, configurable from the environment in `main`.
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
-    /// First backoff step; doubles every attempt.
+    /// First backoff step; grows by `BACKOFF_FACTOR` every attempt.
     pub base: Duration,
     /// Upper bound on any single wait.
     pub cap: Duration,
@@ -298,22 +304,24 @@ pub struct RetryPolicy {
     /// traffic: the client keeps hammering an endpoint the server has already
     /// answered with a throttle. A finite cap turns a persistent throttle into
     /// a visible error the user can act on, instead of an invisible hammer.
-    /// `0` means unlimited (opt-in, via `DS_MAX_RETRIES=0`).
+    /// `0` means unlimited, which is the default: retries are bounded by the
+    /// growing backoff, not by a fixed attempt count.
     pub max_attempts: u32,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            // Start gently and grow: throttling is normal and worth waiting
-            // out, but only for a bounded number of attempts.
-            base: Duration::from_secs(1),
-            cap: Duration::from_secs(60),
+            // Start with a real pause and grow fast: throttling is normal and
+            // worth waiting out, and the wait itself keeps the retries polite,
+            // so there is no fixed attempt cap.
+            base: Duration::from_secs(2),
+            cap: Duration::from_secs(300),
             // Never fire requests back-to-back by default. Zero-gap bursts are
             // indistinguishable from automation, which is exactly what gets an
             // account flagged for botting.
             min_gap: Duration::from_millis(1500),
-            max_attempts: 8,
+            max_attempts: 0,
         }
     }
 }
@@ -381,7 +389,7 @@ async fn post_json(
             if envelope_rate_limited(&v) {
                 if policy.exhausted(attempt) {
                     bail!(
-                        "{label}: still throttled after {} attempts; giving up instead of retrying forever (raise DS_MAX_RETRIES to wait longer)",
+                        "{label}: still throttled after {} attempts; giving up instead of retrying forever (set DS_MAX_RETRIES=0 to retry without a cap)",
                         attempt + 1
                     );
                 }
@@ -411,7 +419,7 @@ async fn post_json(
 
         if policy.exhausted(attempt) {
             bail!(
-                "{label}: still failing after {} attempts (last: {status}); giving up instead of retrying forever",
+                "{label}: still failing after {} attempts (last: {status}); giving up instead of retrying forever (set DS_MAX_RETRIES=0 for no cap)",
                 attempt + 1
             );
         }
@@ -461,7 +469,7 @@ async fn get_json(
             if envelope_rate_limited(&v) {
                 if policy.exhausted(attempt) {
                     bail!(
-                        "{label}: still throttled after {} attempts; giving up instead of retrying forever (raise DS_MAX_RETRIES to wait longer)",
+                        "{label}: still throttled after {} attempts; giving up instead of retrying forever (set DS_MAX_RETRIES=0 to retry without a cap)",
                         attempt + 1
                     );
                 }
@@ -491,7 +499,7 @@ async fn get_json(
 
         if policy.exhausted(attempt) {
             bail!(
-                "{label}: still failing after {} attempts (last: {status}); giving up instead of retrying forever",
+                "{label}: still failing after {} attempts (last: {status}); giving up instead of retrying forever (set DS_MAX_RETRIES=0 for no cap)",
                 attempt + 1
             );
         }
@@ -1186,7 +1194,7 @@ impl DeepSeekClient {
                 if retry_wait.is_some() || !progressed {
                     if policy.exhausted(attempt) {
                         yield Err(anyhow::anyhow!(
-                            "completion: no usable output after {} attempts; giving up rather than re-opening the stream forever",
+                            "completion: no usable output after {} attempts; giving up rather than re-opening the stream forever (set DS_MAX_RETRIES=0 for no cap)",
                             attempt + 1
                         ));
                         return;
@@ -1225,21 +1233,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retry_policy_is_bounded_by_default() {
+    fn retry_policy_has_no_attempt_cap_by_default() {
         let p = RetryPolicy::default();
-        assert!(p.max_attempts > 0, "default policy must not retry forever");
+        assert_eq!(p.max_attempts, 0, "default policy must not cap retries");
         assert!(!p.min_gap.is_zero(), "default policy must pace requests");
         assert!(!p.exhausted(0));
-        assert!(p.exhausted(p.max_attempts));
+        assert!(!p.exhausted(1_000_000));
     }
 
     #[test]
-    fn unlimited_retries_is_explicit_opt_in() {
+    fn attempt_cap_can_still_be_opted_in() {
         let p = RetryPolicy {
-            max_attempts: 0,
+            max_attempts: 3,
             ..RetryPolicy::default()
         };
-        assert!(!p.exhausted(1_000_000));
+        assert!(!p.exhausted(2));
+        assert!(p.exhausted(3));
+    }
+
+    #[test]
+    fn backoff_starts_high_and_grows_fast() {
+        let p = RetryPolicy::default();
+        assert!(
+            p.base >= Duration::from_secs(2),
+            "start wait should be more than a token pause"
+        );
+        assert!(
+            p.cap >= Duration::from_secs(300),
+            "maximum wait should be generous"
+        );
+        // Jitter halves the value at worst, so compare the exponent alone.
+        let at = |n: u32| {
+            let exp = p.base.saturating_mul(BACKOFF_FACTOR.saturating_pow(n));
+            exp.min(p.cap)
+        };
+        assert!(at(1) >= p.base * 4);
+        assert!(at(2) >= p.base * 16);
+        assert_eq!(at(30), p.cap);
     }
 
     #[test]

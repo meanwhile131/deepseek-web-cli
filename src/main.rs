@@ -1088,14 +1088,15 @@ async fn main() -> Result<()> {
 
     // Rate-limit policy, tunable from the environment.
     //
-    // Defaults are deliberately conservative. A previous version retried
-    // forever with no spacing between requests, which is indistinguishable
-    // from a scraper and is what got accounts flagged for botting.
+    // Defaults are deliberately generous: retries start after a real pause,
+    // grow fast, and wait a long time at the ceiling. The spacing (not a fixed
+    // attempt count) is what keeps the traffic polite, so there is no retry
+    // cap by default; `DS_MAX_RETRIES` can still set one explicitly.
     let policy = api::RetryPolicy {
-        base: std::time::Duration::from_millis(env_u64("DS_RETRY_BASE_MS", 1_000)),
-        cap: std::time::Duration::from_millis(env_u64("DS_RETRY_CAP_MS", 60_000)),
+        base: std::time::Duration::from_millis(env_u64("DS_RETRY_BASE_MS", 2_000)),
+        cap: std::time::Duration::from_millis(env_u64("DS_RETRY_CAP_MS", 300_000)),
         min_gap: std::time::Duration::from_millis(env_u64("DS_MIN_GAP_MS", 1_500)),
-        max_attempts: env_u64("DS_MAX_RETRIES", 8) as u32,
+        max_attempts: env_u64("DS_MAX_RETRIES", 0) as u32,
     };
     eprintln!(
         "[rate-limit] max_retries={} base={:?} cap={:?} min_gap={:?}",
