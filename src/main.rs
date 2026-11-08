@@ -19,7 +19,7 @@ const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with a local shell.
 Run commands in blocks of exactly this form (never in reasoning, never in markdown fences):
 <shell>command goes here</shell>
 One command per block; batch several per reply. Blocks run automatically; output returns as [SHELL OUTPUT].
-Commands run in the current directory, which is also HOME. The rest of the filesystem is read-only (bubblewrap/sandbox-exec), so do not write outside it."#;
+Commands run in the current directory. The rest of the filesystem is read-only (bubblewrap/sandbox-exec), so do not write outside it; HOME is your real home directory and is read-only there."#;
 
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";
@@ -1076,7 +1076,7 @@ async fn main() -> Result<()> {
         if !shell::os_sandbox_available() {
             eprintln!(
                 "{} no OS sandbox helper (bubblewrap on Linux, sandbox-exec on macOS) found; \
-                 commands run with the current directory as their working directory and HOME, \
+                 commands run with the current directory as their working directory, \
                  but absolute paths are not confined. Use --unsandboxed to silence this.",
                 paint("1;33", "[warn]")
             );

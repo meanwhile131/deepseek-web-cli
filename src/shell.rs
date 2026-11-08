@@ -64,7 +64,7 @@ pub enum Confinement {
     /// Confined by an OS sandbox (bubblewrap on Linux, `sandbox-exec` on macOS):
     /// the rest of the filesystem is read-only and writes outside the root fail.
     Os,
-    /// Best effort only: the working directory and `HOME` are redirected into
+    /// Best effort only: the working directory and `TMPDIR` are redirected into
     /// the root, but nothing stops an absolute path from being read or written.
     /// Used when no OS sandbox helper is installed.
     WorkingDir,
@@ -132,12 +132,12 @@ fn build_command(cmd: &str, sandbox_root: Option<&Path>) -> (Command, Confinemen
         // WorkingDir, or an OS branch that was compiled out.
         _ => plain_shell(cmd),
     };
-    // In every sandboxed mode the command starts in the root and treats it as
-    // home, so relative paths and `~` land inside the sandbox.
-    c.current_dir(root)
-        .env("HOME", root)
-        .env("TMPDIR", root)
-        .env("PWD", root);
+    // In every sandboxed mode the command starts in the root, so relative
+    // paths land inside the sandbox. `HOME` is deliberately left alone: the
+    // user's real home is visible (read-only under the OS sandbox) and tools
+    // that key off `HOME` keep working as usual. `TMPDIR` and `PWD` are
+    // redirected so scratch files and relative paths stay inside the root.
+    c.current_dir(root).env("TMPDIR", root).env("PWD", root);
     (c, level)
 }
 
@@ -215,9 +215,9 @@ fn sandbox_exec_shell(cmd: &str, _root: &Path) -> Command {
 /// per stream.
 ///
 /// When `sandbox_root` is `Some`, the command runs with that directory as its
-/// working directory and `HOME`, and - where an OS sandbox helper is
-/// available - with the rest of the filesystem read-only. Passing `None` runs
-/// the command unconfined.
+/// working directory and - where an OS sandbox helper is available - with the
+/// rest of the filesystem read-only. `HOME` is inherited unchanged. Passing
+/// `None` runs the command unconfined.
 pub async fn run_shell(
     cmd: &str,
     timeout: Duration,
@@ -543,13 +543,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_sets_home_inside_the_root() {
+    async fn sandbox_leaves_home_alone() {
         let root = std::env::temp_dir().join(format!("ds-home-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
+        let expected = std::env::var("HOME").unwrap_or_default();
         let out = run_shell("echo $HOME", Duration::from_secs(10), Some(&root))
             .await
             .expect("run_shell ok");
-        assert_eq!(out.trim(), root.display().to_string());
+        assert_eq!(out.trim(), expected, "HOME was overridden in the sandbox");
         let _ = std::fs::remove_dir_all(&root);
     }
 

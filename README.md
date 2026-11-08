@@ -151,8 +151,10 @@ as they arrive, without a confirmation prompt. What bounds them is the
 By default every command runs confined to the directory the CLI was started
 from:
 
-* the working directory, `PWD`, `HOME` and `TMPDIR` are all set to that
-  directory, so relative paths and `~` resolve inside it;
+* the working directory, `PWD` and `TMPDIR` are all set to that directory, so
+  relative paths and scratch files resolve inside it. `HOME` is deliberately
+  left at the user's real home (read-only under the OS sandbox), so tools that
+  read config from `~` keep working;
 * where an OS sandbox helper is installed the confinement is enforced rather
   than merely conventional. On Linux, [bubblewrap](https://github.com/containers/bubblewrap)
   (`bwrap`) is used: the whole filesystem is mounted read-only and only the
