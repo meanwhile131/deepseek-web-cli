@@ -392,8 +392,24 @@ async fn post_json(
                 .text()
                 .await
                 .with_context(|| format!("{label}: failed to read response"))?;
-            let v: Value = serde_json::from_str(&text)
-                .with_context(|| format!("{label}: invalid JSON response"))?;
+            let v: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    // A non-JSON 200 is usually an HTML challenge/interstitial
+                    // served by the WAF, not an API bug.
+                    let hint = if looks_like_bot_wall(status, &text) {
+                        BOT_WALL_HINT
+                    } else {
+                        ""
+                    };
+                    bail!(
+                        "{label}: invalid JSON response ({}): {}{}",
+                        e,
+                        snippet(&text),
+                        hint
+                    );
+                }
+            };
             if envelope_rate_limited(&v) {
                 if policy.exhausted(attempt) {
                     bail!(
@@ -417,11 +433,17 @@ async fn post_json(
 
         if !is_retryable(status) {
             let text = resp.text().await.unwrap_or_default();
+            let hint = if looks_like_bot_wall(status, &text) {
+                BOT_WALL_HINT
+            } else {
+                ""
+            };
             bail!(
-                "{label} failed after {} attempt(s): {} - {}",
+                "{label} failed after {} attempt(s): {} - {}{}",
                 attempt + 1,
                 status,
-                text
+                text,
+                hint
             );
         }
 
@@ -472,8 +494,24 @@ async fn get_json(
                 .text()
                 .await
                 .with_context(|| format!("{label}: failed to read response"))?;
-            let v: Value = serde_json::from_str(&text)
-                .with_context(|| format!("{label}: invalid JSON response"))?;
+            let v: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    // A non-JSON 200 is usually an HTML challenge/interstitial
+                    // served by the WAF, not an API bug.
+                    let hint = if looks_like_bot_wall(status, &text) {
+                        BOT_WALL_HINT
+                    } else {
+                        ""
+                    };
+                    bail!(
+                        "{label}: invalid JSON response ({}): {}{}",
+                        e,
+                        snippet(&text),
+                        hint
+                    );
+                }
+            };
             if envelope_rate_limited(&v) {
                 if policy.exhausted(attempt) {
                     bail!(
@@ -497,11 +535,17 @@ async fn get_json(
 
         if !is_retryable(status) {
             let text = resp.text().await.unwrap_or_default();
+            let hint = if looks_like_bot_wall(status, &text) {
+                BOT_WALL_HINT
+            } else {
+                ""
+            };
             bail!(
-                "{label} failed after {} attempt(s): {} - {}",
+                "{label} failed after {} attempt(s): {} - {}{}",
                 attempt + 1,
                 status,
-                text
+                text,
+                hint
             );
         }
 
@@ -621,11 +665,17 @@ async fn open_stream(
 
         let retryable = is_retryable(status) || rate_limited;
         if !retryable {
+            let hint = if looks_like_bot_wall(status, &text) {
+                BOT_WALL_HINT
+            } else {
+                ""
+            };
             bail!(
-                "{label} failed after {} attempt(s): {} - {}",
+                "{label} failed after {} attempt(s): {} - {}{}",
                 attempt + 1,
                 status,
-                text
+                text,
+                hint
             );
         }
 
@@ -671,6 +721,78 @@ async fn sleep_or_cancel(dur: Duration, cancel: &mut Option<watch::Receiver<u64>
     }
 }
 
+/// Default `User-Agent`, kept in step with the `sec-ch-ua*` client hints below.
+const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/// Headers the DeepSeek web app attaches to every API call.
+///
+/// A request carrying only `Authorization` and a `User-Agent` is trivially
+/// distinguishable from the web client: browsers always send `Origin`,
+/// `Referer`, `Accept-Language`, the `Sec-Fetch-*` / `Sec-CH-UA*` hints and the
+/// app's own `x-client-*` headers.  Their absence is a classic automated-client
+/// signal (and some WAF rules reject such requests outright), so mirror the set
+/// the web app sends.  `DS_BROWSER_HEADERS=0` turns this off if a deployment
+/// ever objects to it.
+fn browser_headers() -> header::HeaderMap {
+    fn name(s: &'static str) -> header::HeaderName {
+        header::HeaderName::from_static(s)
+    }
+    let mut h = header::HeaderMap::new();
+    h.insert(header::ACCEPT, header::HeaderValue::from_static("*/*"));
+    h.insert(
+        header::ACCEPT_LANGUAGE,
+        header::HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    h.insert(
+        header::ORIGIN,
+        header::HeaderValue::from_static("https://chat.deepseek.com"),
+    );
+    h.insert(
+        header::REFERER,
+        header::HeaderValue::from_static("https://chat.deepseek.com/"),
+    );
+    // The web app's own client identification.
+    for (k, v) in [
+        ("x-client-platform", "web"),
+        ("x-client-version", "1.0.0-always"),
+        ("x-app-version", "20241129.1"),
+        ("x-client-locale", "en_US"),
+        (
+            "sec-ch-ua",
+            "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+        ),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Linux\""),
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-dest", "empty"),
+    ] {
+        h.insert(name(k), header::HeaderValue::from_static(v));
+    }
+    h
+}
+
+/// Whether the browser-parity headers should be sent (default: yes).
+fn browser_headers_enabled() -> bool {
+    !matches!(
+        std::env::var("DS_BROWSER_HEADERS")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+/// The `User-Agent` to send, overridable with `DS_USER_AGENT`.
+fn user_agent() -> String {
+    std::env::var("DS_USER_AGENT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string())
+}
+
 /// Build the shared HTTP client.
 ///
 /// A stalled connection must not hang a turn forever, so both connect and
@@ -685,11 +807,68 @@ fn build_http(headers: header::HeaderMap, timeout: Option<Duration>) -> Result<C
         // request can never carry a cookie the user did not choose to send.
         .connect_timeout(timeout.min(Duration::from_secs(30)))
         .timeout(timeout)
-        .user_agent(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        )
+        .user_agent(user_agent())
         .build()?)
+}
+
+/// Hint appended to errors that look like an anti-bot rejection.
+const BOT_WALL_HINT: &str = " -- the server looks like it has flagged this client as automated. \
+Check, in order: that the token still belongs to the *current* browser session \
+(`deepseek --login`), that `DS_SESSION_ID` was copied from that same session, that \
+`DS_BROWSER_HEADERS` is not disabled, and that no other client (a script, or the \
+browser itself) is driving the same account concurrently. Then wait a while before \
+retrying: repeated attempts right now only extend the block.";
+
+/// A short, single-line excerpt of a body, for error messages.
+fn snippet(text: &str) -> String {
+    let flat: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.chars().count() <= 200 {
+        flat
+    } else {
+        let cut: String = flat.chars().take(200).collect();
+        format!("{cut}...")
+    }
+}
+
+/// True when a response looks like an anti-bot / risk-control rejection rather
+/// than an ordinary API error.
+fn looks_like_bot_wall(status: StatusCode, body: &str) -> bool {
+    if matches!(status.as_u16(), 403 | 418) {
+        return true;
+    }
+    let h = body.to_ascii_lowercase();
+    [
+        "captcha",
+        "verify you are human",
+        "verify_code",
+        "are you a robot",
+        "unusual traffic",
+        "bot detection",
+        "bot_detection",
+        "risk control",
+        "risk_control",
+        "abnormal request",
+        "abnormal_request",
+        "automated",
+    ]
+    .iter()
+    .any(|needle| h.contains(needle))
+}
+
+/// The optional Shumei device fingerprint (`DS_SHUMEI_DEVICE_ID`).
+///
+/// The web client generates this blob in the browser and sends it with its chat
+/// requests; it lets the server tie a request to the browser it came from. A
+/// client that never sends one stands out, so it is forwarded whenever the user
+/// has captured one.
+fn shumei_device_id() -> Option<String> {
+    std::env::var("DS_SHUMEI_DEVICE_ID")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Request body for `chat/continue`, mirroring the captured HAR:
@@ -761,6 +940,15 @@ pub struct DeepSeekClient {
 impl DeepSeekClient {
     pub fn new(session_id: Option<String>, bearer: String) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
+        // Mirror the web app's browser headers first; the credentials below are
+        // layered on top. See `browser_headers` for why they matter.
+        if browser_headers_enabled() {
+            for (k, v) in browser_headers() {
+                if let Some(k) = k {
+                    headers.insert(k, v);
+                }
+            }
+        }
         // The Bearer token is the only credential the API actually checks: the
         // web app authenticates with it alone, and the endpoints answer
         // identically with no cookie, a stale cookie, or a bogus one.  The
@@ -1017,7 +1205,7 @@ impl DeepSeekClient {
 
         // Completion request with conversation threading. PoW is solved inside
         // `open_stream`, once per attempt, so throttled retries stay valid.
-        let body = json!({
+        let mut body = json!({
             "chat_session_id": session_id,
             "parent_message_id": parent_json,
             "model_type": "default",
@@ -1029,6 +1217,12 @@ impl DeepSeekClient {
             "preempt": false,
             "stream": true,
         });
+        // The web client sends the Shumei device fingerprint with completions
+        // too. Without one, a completion is a device-less request, which is a
+        // strong automation signal; forward the user's blob when configured.
+        if let Some(device) = shumei_device_id() {
+            body["shumei_device_id"] = Value::String(device);
+        }
 
         self.open_chat_stream(
             body,
@@ -1073,10 +1267,7 @@ impl DeepSeekClient {
                 )
             })?;
 
-        let device = std::env::var("DS_SHUMEI_DEVICE_ID")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let device = shumei_device_id();
         let body = continue_body(&session_id, &message_id, device.as_deref());
 
         self.open_chat_stream(
