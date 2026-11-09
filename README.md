@@ -186,6 +186,7 @@ a space to keep it out of the history.
 | `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
 | `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
 | `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |
+| `DS_FORCE_HTTP1` | `0` | pin the HTTP client to HTTP/1.1 (escape hatch for proxies that break h2 negotiation) |
 | `DS_BROWSER_HEADERS` | `1` | send the web app's browser headers (`0`/`false`/`no`/`off` disables) |
 | `DS_USER_AGENT` | Chrome on the host OS | override the `User-Agent`; the client hints are re-derived to match it |
 | `DS_CLIENT_LOCALE` | `en_US` | `x-client-locale`; `Accept-Language` is derived from it |
@@ -233,7 +234,7 @@ contradicts anything else:
 - `Referer` is the conversation URL (`/a/chat/s/<id>`) once a session exists,
   not the site root on every call.
 - The completion body matches the HAR: `action: null`, no `stream` key.
-- Connections are HTTP/2 with keep-alive pooling, like a browser tab.
+- Connections negotiate HTTP/2 over ALPN and fall back to HTTP/1.1, with keep-alive pooling, like a browser tab. `DS_FORCE_HTTP1=1` forces HTTP/1.1.
 
 Requests are also paced (`DS_MIN_GAP_MS`) and retries jittered, so the traffic
 shape - not just the headers - looks like a person typing, not a scraper. Set

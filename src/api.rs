@@ -1063,6 +1063,17 @@ fn browser_headers() -> header::HeaderMap {
     h
 }
 
+/// Parse a boolean environment flag (`1`/`true`/`yes`/`on`).
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 /// Whether the browser-parity headers should be sent (default: yes).
 fn browser_headers_enabled() -> bool {
     !matches!(
@@ -1086,7 +1097,7 @@ fn user_agent() -> String {
 /// overall request timeouts are set (override with `DS_HTTP_TIMEOUT_MS`).
 fn build_http(headers: header::HeaderMap, timeout: Option<Duration>) -> Result<Client> {
     let timeout = timeout.unwrap_or(Duration::from_secs(180));
-    Ok(Client::builder()
+    let mut b = Client::builder()
         .default_headers(headers)
         // Deliberately no cookie jar: this tool must not accumulate or replay
         // cookies of its own.  Everything it needs is in `headers` (the bearer
@@ -1095,11 +1106,20 @@ fn build_http(headers: header::HeaderMap, timeout: Option<Duration>) -> Result<C
         .connect_timeout(timeout.min(Duration::from_secs(30)))
         .timeout(timeout)
         .user_agent(user_agent())
-        .http2_prior_knowledge()
         // Keep connections alive the way a browser tab does; closing after
         // each call is itself a scraper trait.
-        .pool_idle_timeout(Duration::from_secs(90))
-        .build()?)
+        .pool_idle_timeout(Duration::from_secs(90));
+    // Protocol selection mirrors a browser: negotiate HTTP/2 over ALPN and
+    // fall back to HTTP/1.1 when the server (or a middlebox in front of it)
+    // only offers 1.1.  Do NOT use `http2_prior_knowledge()`: that sends the
+    // h2 preface unconditionally, and any endpoint or proxy that answers in
+    // HTTP/1.1 then trips `frame with invalid size` on the first request.
+    // `DS_FORCE_HTTP1=1` pins the client to HTTP/1.1 as an escape hatch for
+    // proxies that corrupt h2 upgrade negotiations.
+    if env_flag("DS_FORCE_HTTP1") {
+        b = b.http1_only();
+    }
+    Ok(b.build()?)
 }
 
 /// Hint appended to errors that look like an anti-bot rejection.
@@ -1928,6 +1948,16 @@ mod tests {
             assert!(p.user_agent.contains("X11; Linux x86_64"));
             assert_eq!(p.platform, "\"Linux\"");
         }
+    }
+
+    #[test]
+    fn client_builds_with_alpn_negotiation() {
+        // Regression: `http2_prior_knowledge()` sent the h2 preface
+        // unconditionally and made hosts/proxies that answer in HTTP/1.1
+        // fail with `http2 error: frame with invalid size`. The client must
+        // build with normal protocol negotiation instead.
+        let c = build_http(header::HeaderMap::new(), None);
+        assert!(c.is_ok(), "{:?}", c.err());
     }
 
     #[test]
