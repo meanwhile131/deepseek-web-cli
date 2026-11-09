@@ -188,6 +188,10 @@ a space to keep it out of the history.
 | `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |
 | `DS_BROWSER_HEADERS` | `1` | send the web app's browser headers (`0`/`false`/`no`/`off` disables) |
 | `DS_USER_AGENT` | Chrome on the host OS | override the `User-Agent`; the client hints are re-derived to match it |
+| `DS_CLIENT_LOCALE` | `en_US` | `x-client-locale`; `Accept-Language` is derived from it |
+| `DS_TIMEZONE_OFFSET` | local offset | `x-client-timezone-offset` in seconds east of UTC |
+| `DS_DEVICE_ID` | derived, stable | `x-device-id`; must stay the same across runs |
+| `DS_HIF_LEIM` / `DS_HIF_DLIQ` | unset | optional captured `x-hif-*` anti-bot tokens forwarded with completions |
 | `DS_GOALS_FILE` | XDG data dir | where per-conversation goals live |
 | `DS_SECRETS_FILE` | XDG config dir | where credentials are read from and saved |
 | `DS_HISTORY_FILE` | XDG config dir | where prompt history is read from and saved |
@@ -216,9 +220,20 @@ contradicts anything else:
 - `Accept-Encoding: gzip, deflate, br, zstd` matches the encodings the client
   can actually decode, so compressed responses look (and are handled) like the
   browser's.
-- `Origin`, `Referer`, `Accept-Language`, `Sec-Fetch-Site/Mode/Dest`,
-  `Priority`, and the app's own `x-client-*` headers are set as the web app
-  sets them.
+- `Origin`, `Accept-Language`, `Sec-Fetch-Site/Mode/Dest`, `DNT`, `Sec-GPC`,
+  `TE: trailers`, `Priority: u=0`, and the app's own `x-client-version`
+  (`2.7.1`), `x-client-bundle-id`, `x-client-locale`, `x-client-timezone-offset`,
+  `x-device-id` and `x-device-model` headers are set exactly as the web app
+  sends them in the captured HAR.
+- `x-client-locale` and `Accept-Language` are derived from each other, and
+  `x-client-timezone-offset` is the machine's real offset, so the locale and
+  timezone in the request are not a UTC/English default that stands out.
+- `x-device-id` is a stable UUIDv4 derived from the host and kept the same
+  across runs, the way a browser keeps one per profile.
+- `Referer` is the conversation URL (`/a/chat/s/<id>`) once a session exists,
+  not the site root on every call.
+- The completion body matches the HAR: `action: null`, no `stream` key.
+- Connections are HTTP/2 with keep-alive pooling, like a browser tab.
 
 Requests are also paced (`DS_MIN_GAP_MS`) and retries jittered, so the traffic
 shape - not just the headers - looks like a person typing, not a scraper. Set

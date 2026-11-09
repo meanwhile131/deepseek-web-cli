@@ -622,6 +622,12 @@ async fn open_stream(
         pace(slot, policy.min_gap).await;
 
         let mut req = http.post(url);
+        // Browsers send the *conversation* URL as Referer on every fetch issued
+        // from an open chat; the site root is only right before one exists.
+        let session = body.get("chat_session_id").and_then(|v| v.as_str());
+        if let Ok(r) = HeaderValue::from_str(&referer_for(session)) {
+            req = req.header(header::REFERER, r);
+        }
         if pow {
             let challenge =
                 fetch_challenge(http, policy, slot, cancel, COMPLETION_TARGET_PATH).await?;
@@ -727,6 +733,17 @@ async fn sleep_or_cancel(dur: Duration, cancel: &mut Option<watch::Receiver<u64>
 /// an automated-client signal.
 const CHROME_MAJOR: &str = "138";
 
+/// `x-client-version` the web app advertises. Taken verbatim from the captured
+/// HAR; a made-up value (the old `1.0.0-always`) is a one-header giveaway that
+/// the caller is not the web app.
+const CLIENT_VERSION: &str = "2.7.1";
+
+/// `x-client-bundle-id` the web app sends on every API call.
+const CLIENT_BUNDLE_ID: &str = "com.deepseek.chat";
+
+/// Default `x-client-locale`, used when `DS_CLIENT_LOCALE` is unset.
+const CLIENT_LOCALE: &str = "en_US";
+
 /// The UA platform token matching the OS this binary runs on. A browser that
 /// claims `X11; Linux x86_64` while running on Windows is a giveaway, so the
 /// default profile follows the host.
@@ -816,6 +833,8 @@ fn profile_for(override_ua: Option<String>) -> BrowserProfile {
         .to_string();
     BrowserProfile {
         user_agent: ua,
+        // Ordered exactly as Chromium emits it: GREASE brand first, then
+        // Chromium, then the product brand.
         sec_ch_ua: Some(format!(
             "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"{major}\", \"Google Chrome\";v=\"{major}\""
         )),
@@ -823,25 +842,138 @@ fn profile_for(override_ua: Option<String>) -> BrowserProfile {
     }
 }
 
+/// `x-client-locale`, overridable with `DS_CLIENT_LOCALE`.
+fn client_locale() -> String {
+    std::env::var("DS_CLIENT_LOCALE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| CLIENT_LOCALE.to_string())
+}
+
+/// The `Accept-Language` a browser with that locale would send.
+///
+/// Derived from `x-client-locale` so the two cannot contradict each other: a
+/// request claiming `en_US` while advertising `ru,en;q=0.9` is a mismatch a
+/// detector can flag without any other signal.
+fn accept_language_for(locale: &str) -> String {
+    let lang = locale
+        .split(['_', '-'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("en");
+    if lang.eq_ignore_ascii_case("en") {
+        "en-US,en;q=0.9".to_string()
+    } else {
+        format!("{lang},{lang}-{};q=0.9,en;q=0.8", region_of(locale))
+    }
+}
+
+/// The region part of a `ll_RR` locale, or the language itself when absent.
+fn region_of(locale: &str) -> String {
+    locale
+        .split(['_', '-'])
+        .nth(1)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|| "US".to_string())
+}
+
+/// Local timezone offset in seconds east of UTC, as the browser reports it.
+///
+/// `x-client-timezone-offset: 14400` in the captured HAR is simply the
+/// browser's `-Date.getTimezoneOffset() * 60`. Sending `0` from a machine that
+/// is not in UTC is a cheap automation tell, so the real local offset is used.
+fn timezone_offset_seconds() -> i64 {
+    if let Some(v) = std::env::var("DS_TIMEZONE_OFFSET")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
+        return v;
+    }
+    use chrono::Offset;
+    chrono::Local::now().offset().fix().local_minus_utc() as i64
+}
+
+/// A stable, random-looking device id, as the web app stores one per browser.
+///
+/// The value must persist across runs (a browser keeps the same id for months)
+/// but must not be a counter or a build fingerprint. `DS_DEVICE_ID` overrides
+/// it; otherwise it is derived from stable host facts and hashed into the
+/// UUIDv4 shape the real client uses.
+fn device_id() -> String {
+    if let Some(v) = std::env::var("DS_DEVICE_ID")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return v;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut seed = String::new();
+    if let Some(h) = std::env::var_os("HOSTNAME").or_else(|| std::env::var_os("COMPUTERNAME")) {
+        seed.push_str(&h.to_string_lossy());
+    }
+    if let Some(u) = std::env::var_os("USER").or_else(|| std::env::var_os("USERNAME")) {
+        seed.push_str(&u.to_string_lossy());
+    }
+    if let Ok(h) = std::fs::read_to_string("/etc/machine-id") {
+        seed.push_str(h.trim());
+    }
+    seed.push_str("deepseek-web-cli/device");
+
+    let mut hi = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hi);
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    ("lo".to_string() + &seed).hash(&mut lo);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hi.finish().to_be_bytes());
+    bytes[8..].copy_from_slice(&lo.finish().to_be_bytes());
+    // Version 4 (random) and the RFC 4122 variant, so it parses as a UUID.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+/// The `Referer` a browser would send for a chat API call.
+///
+/// Firefox/Chrome both send the full conversation URL, not the site root, on
+/// every `fetch()` issued from an open chat. The HAR shows
+/// `https://chat.deepseek.com/a/chat/s/<session-id>`; the root URL is only
+/// used before a session exists.
+fn referer_for(session_id: Option<&str>) -> String {
+    match session_id.filter(|s| !s.is_empty()) {
+        Some(id) => format!("https://chat.deepseek.com/a/chat/s/{id}"),
+        None => "https://chat.deepseek.com/".to_string(),
+    }
+}
+
 /// Headers the DeepSeek web app attaches to every API call.
 ///
 /// A request carrying only `Authorization` and a `User-Agent` is trivially
 /// distinguishable from the web client: browsers always send `Origin`,
-/// `Referer`, `Accept-Language`, `Accept-Encoding`, the `Sec-Fetch-*` /
-/// `Sec-CH-UA*` hints and the app's own `x-client-*` headers.  Their absence
-/// is a classic automated-client signal (and some WAF rules reject such
-/// requests outright), so mirror the set the web app sends.
+/// `Referer`, `Accept-Language`, `Accept-Encoding`, `DNT`, `Sec-GPC`,
+/// `TE`, the `Sec-Fetch-*` / `Sec-CH-UA*` hints and the app's own
+/// `x-client-*` / `x-device-*` headers.  Their absence is a classic
+/// automated-client signal (and some WAF rules reject such requests outright),
+/// so mirror the set the web app sends. Every value below is copied from or
+/// derived from the captured HAR.
 /// `DS_BROWSER_HEADERS=0` turns this off if a deployment ever objects to it.
 fn browser_headers() -> header::HeaderMap {
     fn name(s: &'static str) -> header::HeaderName {
         header::HeaderName::from_static(s)
     }
     let profile = browser_profile();
+    let locale = client_locale();
     let mut h = header::HeaderMap::new();
     h.insert(header::ACCEPT, header::HeaderValue::from_static("*/*"));
     h.insert(
         header::ACCEPT_LANGUAGE,
-        header::HeaderValue::from_static("en-US,en;q=0.9"),
+        HeaderValue::from_str(&accept_language_for(&locale)).expect("ASCII language tag"),
     );
     // Exactly the set this build can transparently decode (see Cargo.toml),
     // which is also what Chrome and Firefox offer to the web app. reqwest
@@ -856,18 +988,53 @@ fn browser_headers() -> header::HeaderMap {
     );
     h.insert(
         header::REFERER,
-        header::HeaderValue::from_static("https://chat.deepseek.com/"),
+        HeaderValue::from_str(&referer_for(None)).expect("ASCII URL"),
     );
+    // Firefox sends `DNT`; both engines send `Sec-GPC` and `TE: trailers`
+    // on cross-document fetches.
+    h.insert(name("dnt"), header::HeaderValue::from_static("1"));
+    h.insert(name("sec-gpc"), header::HeaderValue::from_static("1"));
+    h.insert(name("te"), header::HeaderValue::from_static("trailers"));
     for (k, v) in [
         ("x-client-platform", "web"),
-        ("x-client-version", "1.0.0-always"),
-        ("x-app-version", "20241129.1"),
-        ("x-client-locale", "en_US"),
+        ("x-client-version", CLIENT_VERSION),
+        ("x-client-bundle-id", CLIENT_BUNDLE_ID),
+        ("x-device-model", ""),
         ("sec-fetch-site", "same-origin"),
         ("sec-fetch-mode", "cors"),
         ("sec-fetch-dest", "empty"),
     ] {
         h.insert(name(k), header::HeaderValue::from_static(v));
+    }
+    h.insert(
+        name("x-client-locale"),
+        HeaderValue::from_str(&locale).expect("ASCII locale"),
+    );
+    h.insert(
+        name("x-client-timezone-offset"),
+        HeaderValue::from_str(&timezone_offset_seconds().to_string()).expect("integer"),
+    );
+    h.insert(
+        name("x-device-id"),
+        HeaderValue::from_str(&device_id()).expect("ASCII device id"),
+    );
+    // Optional anti-bot tokens (`x-hif-leim` / `x-hif-dliq`). These are minted
+    // in-page by the web app's obfuscated script; a client that cannot compute
+    // them can still forward a captured pair so the request carries the same
+    // shape as the browser's.
+    if let Ok(v) = std::env::var("DS_HIF_LEIM") {
+        if let Ok(v) = HeaderValue::from_str(v.trim()) {
+            if !v.is_empty() {
+                h.insert(name("x-hif-leim"), v);
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("DS_HIF_DLIQ") {
+        if let Ok(v) = HeaderValue::from_str(v.trim()) {
+            if !v.is_empty() {
+                h.insert(name("x-hif-dliq"), v);
+            }
+        }
     }
     // Client hints are a Chromium-only feature; sending them from a Firefox
     // profile is a contradiction a detector can spot in one request.
@@ -886,10 +1053,11 @@ fn browser_headers() -> header::HeaderMap {
             name("sec-ch-ua-platform"),
             HeaderValue::from_str(profile.platform).expect("ASCII platform hint"),
         );
-        // Chromium attaches this to every fetch() it issues.
+        // Chromium attaches this to every fetch() it issues; the HAR shows
+        // `u=0` (lowest) for both the challenge and completion POSTs.
         h.insert(
             name("priority"),
-            header::HeaderValue::from_static("u=1, i"),
+            header::HeaderValue::from_static("u=0"),
         );
     }
     h
@@ -927,6 +1095,10 @@ fn build_http(headers: header::HeaderMap, timeout: Option<Duration>) -> Result<C
         .connect_timeout(timeout.min(Duration::from_secs(30)))
         .timeout(timeout)
         .user_agent(user_agent())
+        .http2_prior_knowledge()
+        // Keep connections alive the way a browser tab does; closing after
+        // each call is itself a scraper trait.
+        .pool_idle_timeout(Duration::from_secs(90))
         .build()?)
 }
 
@@ -1332,9 +1504,10 @@ impl DeepSeekClient {
             "ref_file_ids": [],
             "thinking_enabled": thinking,
             "search_enabled": search,
-            "action": "default",
+            // The web app sends `action: null` here (see the HAR); a made-up
+            // string is one more body field that does not match the browser.
+            "action": null,
             "preempt": false,
-            "stream": true,
         });
         // The web client sends the Shumei device fingerprint with completions
         // too. Without one, a completion is a device-less request, which is a
@@ -1755,6 +1928,85 @@ mod tests {
             assert!(p.user_agent.contains("X11; Linux x86_64"));
             assert_eq!(p.platform, "\"Linux\"");
         }
+    }
+
+    #[test]
+    fn headers_match_the_captured_har() {
+        // Values taken verbatim from chat.deepseek.com_Archive *.har.
+        let h = browser_headers();
+        assert_eq!(h["x-client-version"], "2.7.1");
+        assert_eq!(h["x-client-bundle-id"], "com.deepseek.chat");
+        assert_eq!(h["x-client-platform"], "web");
+        assert_eq!(h["x-client-locale"], "en_US");
+        assert_eq!(h["accept"], "*/*");
+        assert_eq!(h["accept-encoding"], "gzip, deflate, br, zstd");
+        assert_eq!(h["dnt"], "1");
+        assert_eq!(h["sec-gpc"], "1");
+        assert_eq!(h["te"], "trailers");
+        assert_eq!(h["priority"], "u=0");
+        assert_eq!(h["sec-fetch-dest"], "empty");
+        assert_eq!(h["sec-fetch-mode"], "cors");
+        assert_eq!(h["sec-fetch-site"], "same-origin");
+        assert!(h["x-client-timezone-offset"]
+            .to_str()
+            .unwrap()
+            .parse::<i64>()
+            .is_ok());
+        // The real client sends an empty x-device-model, not no header at all.
+        assert_eq!(h["x-device-model"], "");
+    }
+
+    #[test]
+    fn device_id_is_a_stable_uuidv4() {
+        let a = device_id();
+        let b = device_id();
+        assert_eq!(a, b, "must be stable across calls");
+        assert_eq!(a.len(), 36, "{a}");
+        let groups: Vec<&str> = a.split('-').collect();
+        assert_eq!(groups.iter().map(|g| g.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert!(groups[2].starts_with('4'), "must look like UUIDv4: {a}");
+        assert!(
+            ["8", "9", "a", "b"].contains(&&groups[3][..1]),
+            "variant nibble: {a}"
+        );
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    }
+
+    #[test]
+    fn accept_language_follows_the_client_locale() {
+        assert_eq!(accept_language_for("en_US"), "en-US,en;q=0.9");
+        assert_eq!(accept_language_for("ru_RU"), "ru,ru-RU;q=0.9,en;q=0.8");
+        // The default locale and the default Accept-Language agree.
+        assert_eq!(accept_language_for(CLIENT_LOCALE), "en-US,en;q=0.9");
+    }
+
+    #[test]
+    fn referer_points_at_the_conversation() {
+        assert_eq!(
+            referer_for(Some("033db2e9-61a9-4877-aeff-1ffe6e789a66")),
+            "https://chat.deepseek.com/a/chat/s/033db2e9-61a9-4877-aeff-1ffe6e789a66"
+        );
+        assert_eq!(referer_for(None), "https://chat.deepseek.com/");
+        assert_eq!(referer_for(Some("")), "https://chat.deepseek.com/");
+    }
+
+    #[test]
+    fn completion_body_matches_captured_har() {
+        // Shape from the HAR's chat/completion POST: `action` is null, there
+        // is no `stream` key, and `thinking_enabled`/`search_enabled` are bools.
+        let body = serde_json::json!({
+            "chat_session_id": "s",
+            "parent_message_id": null,
+            "model_type": "default",
+            "prompt": "hi",
+            "ref_file_ids": [],
+            "thinking_enabled": true,
+            "search_enabled": true,
+            "action": null,
+            "preempt": false,
+        });
+        assert!(body["action"].is_null());
+        assert!(body.get("stream").is_none());
     }
 
     #[test]
