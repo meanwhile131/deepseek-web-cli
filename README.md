@@ -54,6 +54,7 @@ own release, but they do not take over the "Latest" marker.
 | `--login` | sign in through the browser even if a token is already saved |
 | `--no-browser` | during sign-in, print the URL instead of opening a browser |
 | `-h`, `--help` | show help and exit |
+| `-V`, `--version` | print the version and exit |
 
 ## Signing in
 

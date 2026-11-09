@@ -1055,10 +1055,7 @@ fn browser_headers() -> header::HeaderMap {
         );
         // Chromium attaches this to every fetch() it issues; the HAR shows
         // `u=0` (lowest) for both the challenge and completion POSTs.
-        h.insert(
-            name("priority"),
-            header::HeaderValue::from_static("u=0"),
-        );
+        h.insert(name("priority"), header::HeaderValue::from_static("u=0"));
     }
     h
 }
@@ -1132,10 +1129,7 @@ retrying: repeated attempts right now only extend the block.";
 
 /// A short, single-line excerpt of a body, for error messages.
 fn snippet(text: &str) -> String {
-    let flat: String = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= 200 {
         flat
     } else {
@@ -1993,7 +1987,10 @@ mod tests {
         assert_eq!(a, b, "must be stable across calls");
         assert_eq!(a.len(), 36, "{a}");
         let groups: Vec<&str> = a.split('-').collect();
-        assert_eq!(groups.iter().map(|g| g.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
         assert!(groups[2].starts_with('4'), "must look like UUIDv4: {a}");
         assert!(
             ["8", "9", "a", "b"].contains(&&groups[3][..1]),
@@ -2042,8 +2039,7 @@ mod tests {
     #[test]
     fn firefox_ua_drops_client_hints() {
         let p = profile_for(Some(
-            "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0"
-                .to_string(),
+            "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0".to_string(),
         ));
         assert!(p.is_firefox(), "Firefox sends no sec-ch-ua hints");
         assert_eq!(p.platform, "\"Linux\"");

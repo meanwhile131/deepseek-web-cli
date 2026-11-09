@@ -156,6 +156,8 @@ struct Args {
     no_browser: bool,
     /// Print usage and exit.
     help: bool,
+    /// Print the version and exit.
+    version: bool,
 }
 
 /// Parse process arguments (excluding the program name).
@@ -177,6 +179,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> ParsedArgs {
             "--login" => parsed.args.login = true,
             "--no-browser" => parsed.args.no_browser = true,
             "-h" | "--help" => parsed.args.help = true,
+            "-V" | "--version" => parsed.args.version = true,
             other => parsed.unknown.push(other.to_string()),
         }
     }
@@ -193,6 +196,7 @@ fn usage() -> &'static str {
      \x20     --login          sign in through the browser even if a token exists\n\
      \x20     --no-browser     during login, print the URL instead of opening it\n\
      \x20 -h, --help           show this help and exit\n\
+     \x20 -V, --version        show the version and exit\n\
      \n\
      Model-proposed shell commands run without asking, in a sandbox rooted at\n\
      the directory the CLI was started from. Pass --unsandboxed to lift that.\n\
@@ -540,8 +544,7 @@ async fn run_goal_turns(
     interrupt: &Interrupt,
 ) {
     let Some(text) = goal.clone() else { return };
-    let max_turns =
-        env_u64("DS_MAX_GOAL_TURNS", DEFAULT_MAX_GOAL_TURNS as u64).max(1) as usize;
+    let max_turns = env_u64("DS_MAX_GOAL_TURNS", DEFAULT_MAX_GOAL_TURNS as u64).max(1) as usize;
     let mut turn = 0usize;
     loop {
         turn += 1;
@@ -572,7 +575,8 @@ async fn run_goal_turns(
             debug_pending,
             goal,
         };
-        let completed = match run_turn(client, ReplySource::Message(&message), &cfg, interrupt).await
+        let completed = match run_turn(client, ReplySource::Message(&message), &cfg, interrupt)
+            .await
         {
             Ok(TurnResult::Done { completed }) => completed,
             Ok(TurnResult::Interrupted) => {
@@ -1202,6 +1206,10 @@ async fn main() -> Result<()> {
         println!("{}", usage());
         return Ok(());
     }
+    if parsed.args.version {
+        println!("deepseek {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if !parsed.unknown.is_empty() {
         eprintln!(
             "{} unknown argument(s): {}",
@@ -1784,7 +1792,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         goal_completed, goal_continue_prompt, goal_start_prompt, parse_args, parse_goal_command,
-        parse_secrets, with_goal, GoalCommand, ParsedArgs, SessionCache,
+        parse_secrets, usage, with_goal, GoalCommand, ParsedArgs, SessionCache,
     };
     use crate::sessions;
 
@@ -2056,6 +2064,19 @@ mod tests {
     fn accepts_help_flag() {
         assert!(parse(&["--help"]).args.help);
         assert!(parse(&["-h"]).args.help);
+    }
+
+    #[test]
+    fn accepts_version_flag() {
+        assert!(parse(&["--version"]).args.version);
+        assert!(parse(&["-V"]).args.version);
+        // `-v` (lowercase) is not a documented alias and stays an error.
+        assert_eq!(parse(&["-v"]).unknown, vec!["-v"]);
+    }
+
+    #[test]
+    fn help_text_documents_version_flag() {
+        assert!(usage().contains("--version"));
     }
 
     #[test]
