@@ -186,18 +186,43 @@ a space to keep it out of the history.
 | `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
 | `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
 | `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |
-
-Requests are paced and retries back off exponentially (base x4 per attempt,
-jittered, up to the ceiling) with no fixed attempt cap by default. A client
-that retries forever with no spacing looks like a scraper to abuse detection;
-the growing wait is what keeps retries polite, so keep `DS_MIN_GAP_MS` above
-zero and raise it rather than setting it to `0`.
+| `DS_BROWSER_HEADERS` | `1` | send the web app's browser headers (`0`/`false`/`no`/`off` disables) |
+| `DS_USER_AGENT` | Chrome on the host OS | override the `User-Agent`; the client hints are re-derived to match it |
 | `DS_GOALS_FILE` | XDG data dir | where per-conversation goals live |
 | `DS_SECRETS_FILE` | XDG config dir | where credentials are read from and saved |
 | `DS_HISTORY_FILE` | XDG config dir | where prompt history is read from and saved |
 | `DS_DEBUG_PENDING` | `0` | dump model output and extracted commands |
 | `DS_DEBUG_SECRETS` | `0` | report which secrets file was loaded |
 | `NO_COLOR` / `CLICOLOR_FORCE` | - | follow https://no-color.org |
+
+Requests are paced and retries back off exponentially (base x4 per attempt,
+jittered, up to the ceiling) with no fixed attempt cap by default. A client
+that retries forever with no spacing looks like a scraper to abuse detection;
+the growing wait is what keeps retries polite, so keep `DS_MIN_GAP_MS` above
+zero and raise it rather than setting it to `0`.
+
+### Blending in with browser traffic
+
+Every request is dressed as the web app itself makes it, because a call that
+sends only `Authorization` and a bare `User-Agent` is easy to tell apart from a
+browser. The headers are built from one coherent profile, so nothing
+contradicts anything else:
+
+- `User-Agent` defaults to Chrome on the platform the binary is running on
+  (Linux, macOS or Windows), not a hard-coded string.
+- `sec-ch-ua` / `sec-ch-ua-platform` / `sec-ch-ua-mobile` carry the same Chrome
+  major version and the same OS as the UA. A Firefox UA (`DS_USER_AGENT`) drops
+  the `Sec-CH-UA*` hints entirely, since Firefox sends none.
+- `Accept-Encoding: gzip, deflate, br, zstd` matches the encodings the client
+  can actually decode, so compressed responses look (and are handled) like the
+  browser's.
+- `Origin`, `Referer`, `Accept-Language`, `Sec-Fetch-Site/Mode/Dest`,
+  `Priority`, and the app's own `x-client-*` headers are set as the web app
+  sets them.
+
+Requests are also paced (`DS_MIN_GAP_MS`) and retries jittered, so the traffic
+shape - not just the headers - looks like a person typing, not a scraper. Set
+`DS_BROWSER_HEADERS=0` to send the credentials alone if a deployment objects.
 
 ## Shell commands
 

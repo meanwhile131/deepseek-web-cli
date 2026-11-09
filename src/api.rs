@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{Stream, StreamExt};
-use reqwest::{header, Client, Response, StatusCode};
+use reqwest::{header, header::HeaderValue, Client, Response, StatusCode};
 use serde_json::{json, Value};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -721,28 +721,134 @@ async fn sleep_or_cancel(dur: Duration, cancel: &mut Option<watch::Receiver<u64>
     }
 }
 
-/// Default `User-Agent`, kept in step with the `sec-ch-ua*` client hints below.
-const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+/// Chrome major version the default profile imitates. The `User-Agent` and the
+/// `sec-ch-ua*` client hints are both derived from it, so they cannot drift
+/// apart: a Chrome UA announcing a different major than `sec-ch-ua` is itself
+/// an automated-client signal.
+const CHROME_MAJOR: &str = "138";
+
+/// The UA platform token matching the OS this binary runs on. A browser that
+/// claims `X11; Linux x86_64` while running on Windows is a giveaway, so the
+/// default profile follows the host.
+fn host_ua_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows NT 10.0; Win64; x64"
+    } else if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else {
+        "X11; Linux x86_64"
+    }
+}
+
+/// `sec-ch-ua-platform` value implied by a UA string.
+fn hint_platform_from_ua(ua: &str) -> &'static str {
+    if ua.contains("Windows NT") {
+        "\"Windows\""
+    } else if ua.contains("Macintosh") || ua.contains("Mac OS X") {
+        "\"macOS\""
+    } else if ua.contains("Android") {
+        "\"Android\""
+    } else {
+        "\"Linux\""
+    }
+}
+
+/// One coherent set of browser request headers.
+///
+/// Servers, and the bot detection in front of them, cross-check these: the UA
+/// string against the client hints, the hint set against the claimed engine
+/// (Firefox sends no `sec-ch-ua*` at all), and the platform hint against the
+/// OS named in the UA. An inconsistent set is more suspicious than a sparse
+/// one, so every header here is derived from the same profile.
+struct BrowserProfile {
+    user_agent: String,
+    /// `sec-ch-ua` value; `None` for engines that do not send client hints.
+    sec_ch_ua: Option<String>,
+    /// `sec-ch-ua-platform` value, quoted as it goes on the wire.
+    platform: &'static str,
+}
+
+impl BrowserProfile {
+    fn is_firefox(&self) -> bool {
+        self.sec_ch_ua.is_none()
+    }
+}
+
+/// Derive the profile from `DS_USER_AGENT`, or default to Chrome on the host
+/// OS. An override is honoured, but the hints are re-derived from it rather
+/// than left at the defaults, so the two still agree.
+fn browser_profile() -> BrowserProfile {
+    profile_for(
+        std::env::var("DS_USER_AGENT")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+    )
+}
+
+/// The pure part of [`browser_profile`]: same decision table, but with the
+/// override passed in instead of read from the environment, so the rules can
+/// be tested without mutating process-global state.
+fn profile_for(override_ua: Option<String>) -> BrowserProfile {
+    let ua = match override_ua {
+        Some(ua) => ua,
+        None => format!(
+            "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36",
+            host_ua_platform()
+        ),
+    };
+    let platform = hint_platform_from_ua(&ua);
+    if ua.contains("Firefox/") {
+        return BrowserProfile {
+            user_agent: ua,
+            sec_ch_ua: None,
+            platform,
+        };
+    }
+    // Chrome-like: take the hinted major from the UA so the hints cannot drift
+    // away from the string that is actually sent.
+    let major = ua
+        .split("Chrome/")
+        .nth(1)
+        .and_then(|rest| rest.split(['.', ' ']).next())
+        .filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(CHROME_MAJOR)
+        .to_string();
+    BrowserProfile {
+        user_agent: ua,
+        sec_ch_ua: Some(format!(
+            "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"{major}\", \"Google Chrome\";v=\"{major}\""
+        )),
+        platform,
+    }
+}
 
 /// Headers the DeepSeek web app attaches to every API call.
 ///
 /// A request carrying only `Authorization` and a `User-Agent` is trivially
 /// distinguishable from the web client: browsers always send `Origin`,
-/// `Referer`, `Accept-Language`, the `Sec-Fetch-*` / `Sec-CH-UA*` hints and the
-/// app's own `x-client-*` headers.  Their absence is a classic automated-client
-/// signal (and some WAF rules reject such requests outright), so mirror the set
-/// the web app sends.  `DS_BROWSER_HEADERS=0` turns this off if a deployment
-/// ever objects to it.
+/// `Referer`, `Accept-Language`, `Accept-Encoding`, the `Sec-Fetch-*` /
+/// `Sec-CH-UA*` hints and the app's own `x-client-*` headers.  Their absence
+/// is a classic automated-client signal (and some WAF rules reject such
+/// requests outright), so mirror the set the web app sends.
+/// `DS_BROWSER_HEADERS=0` turns this off if a deployment ever objects to it.
 fn browser_headers() -> header::HeaderMap {
     fn name(s: &'static str) -> header::HeaderName {
         header::HeaderName::from_static(s)
     }
+    let profile = browser_profile();
     let mut h = header::HeaderMap::new();
     h.insert(header::ACCEPT, header::HeaderValue::from_static("*/*"));
     h.insert(
         header::ACCEPT_LANGUAGE,
         header::HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    // Exactly the set this build can transparently decode (see Cargo.toml),
+    // which is also what Chrome and Firefox offer to the web app. reqwest
+    // would otherwise fill this in itself, but only when nothing else sets it.
+    h.insert(
+        header::ACCEPT_ENCODING,
+        header::HeaderValue::from_static("gzip, deflate, br, zstd"),
     );
     h.insert(
         header::ORIGIN,
@@ -752,23 +858,39 @@ fn browser_headers() -> header::HeaderMap {
         header::REFERER,
         header::HeaderValue::from_static("https://chat.deepseek.com/"),
     );
-    // The web app's own client identification.
     for (k, v) in [
         ("x-client-platform", "web"),
         ("x-client-version", "1.0.0-always"),
         ("x-app-version", "20241129.1"),
         ("x-client-locale", "en_US"),
-        (
-            "sec-ch-ua",
-            "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
-        ),
-        ("sec-ch-ua-mobile", "?0"),
-        ("sec-ch-ua-platform", "\"Linux\""),
         ("sec-fetch-site", "same-origin"),
         ("sec-fetch-mode", "cors"),
         ("sec-fetch-dest", "empty"),
     ] {
         h.insert(name(k), header::HeaderValue::from_static(v));
+    }
+    // Client hints are a Chromium-only feature; sending them from a Firefox
+    // profile is a contradiction a detector can spot in one request.
+    if !profile.is_firefox() {
+        if let Some(ua_hint) = profile.sec_ch_ua {
+            h.insert(
+                name("sec-ch-ua"),
+                HeaderValue::from_str(&ua_hint).expect("ASCII client hint"),
+            );
+        }
+        h.insert(
+            name("sec-ch-ua-mobile"),
+            header::HeaderValue::from_static("?0"),
+        );
+        h.insert(
+            name("sec-ch-ua-platform"),
+            HeaderValue::from_str(profile.platform).expect("ASCII platform hint"),
+        );
+        // Chromium attaches this to every fetch() it issues.
+        h.insert(
+            name("priority"),
+            header::HeaderValue::from_static("u=1, i"),
+        );
     }
     h
 }
@@ -784,13 +906,10 @@ fn browser_headers_enabled() -> bool {
     )
 }
 
-/// The `User-Agent` to send, overridable with `DS_USER_AGENT`.
+/// The `User-Agent` to send, overridable with `DS_USER_AGENT`. Always the same
+/// value the client hints in [`browser_headers`] were derived from.
 fn user_agent() -> String {
-    std::env::var("DS_USER_AGENT")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string())
+    browser_profile().user_agent
 }
 
 /// Build the shared HTTP client.
@@ -1623,6 +1742,60 @@ mod tests {
         };
         assert!(!p.exhausted(2));
         assert!(p.exhausted(3));
+    }
+
+    #[test]
+    fn default_profile_is_chrome_on_the_host_os() {
+        let p = profile_for(None);
+        assert!(p.user_agent.contains("Chrome/138."), "{}", p.user_agent);
+        let hints = p.sec_ch_ua.expect("Chrome sends client hints");
+        assert!(hints.contains("\"Google Chrome\";v=\"138\""), "{hints}");
+        assert!(hints.contains("\"Chromium\";v=\"138\""), "{hints}");
+        if cfg!(target_os = "linux") {
+            assert!(p.user_agent.contains("X11; Linux x86_64"));
+            assert_eq!(p.platform, "\"Linux\"");
+        }
+    }
+
+    #[test]
+    fn firefox_ua_drops_client_hints() {
+        let p = profile_for(Some(
+            "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0"
+                .to_string(),
+        ));
+        assert!(p.is_firefox(), "Firefox sends no sec-ch-ua hints");
+        assert_eq!(p.platform, "\"Linux\"");
+        assert!(p.user_agent.contains("Firefox/141.0"));
+    }
+
+    #[test]
+    fn client_hints_follow_an_overridden_ua_version() {
+        let p = profile_for(Some(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                .to_string(),
+        ));
+        let hints = p.sec_ch_ua.unwrap();
+        assert!(hints.contains("\"Google Chrome\";v=\"131\""), "{hints}");
+        assert_eq!(p.platform, "\"Windows\"");
+    }
+
+    #[test]
+    fn browser_headers_are_internally_consistent() {
+        let h = browser_headers();
+        // Chrome-shaped profile: hints, encoding and fetch metadata all present.
+        assert!(h.contains_key("sec-ch-ua"));
+        assert!(h.contains_key("sec-ch-ua-platform"));
+        assert!(h.contains_key("sec-ch-ua-mobile"));
+        assert!(h.contains_key("priority"));
+        assert_eq!(h["accept-encoding"], "gzip, deflate, br, zstd");
+        assert_eq!(h["origin"], "https://chat.deepseek.com");
+        assert_eq!(h["x-client-platform"], "web");
+        assert_eq!(h["sec-fetch-site"], "same-origin");
+        // The UA the client sends must name the same platform as the hint.
+        let ua = user_agent();
+        let hint = h["sec-ch-ua-platform"].to_str().unwrap();
+        assert_eq!(hint, hint_platform_from_ua(&ua));
     }
 
     #[test]
