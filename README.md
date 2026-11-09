@@ -132,7 +132,7 @@ previous `AUTHORIZATION_TOKEN` line and leaving the rest of the file untouched.
 | `/goal clear`, `none`, `off` | drop the active goal |
 | `/sessions` | list conversations, oldest first |
 | `/sessions more` | load the next (older) page |
-| `/resume <n|id-prefix>` | continue a saved conversation (restores its goal) |
+| `/resume <n|id-prefix>` | continue a saved conversation (restores its goal and reprompts the model to keep working on it) |
 | `/label <text>` | rename the current conversation |
 | `/forget <n|id-prefix>` | delete a conversation on the server |
 

@@ -455,6 +455,26 @@ fn with_goal(goal: &Option<String>, msg: &str) -> String {
     }
 }
 
+/// The opening prompt for a goal that is being started or restarted.
+///
+/// Shared by `/goal <text>` and by `/resume` when the conversation being
+/// resumed had an active goal: resuming the goal means putting the model back
+/// to work on it, not just printing the saved text.
+fn goal_start_prompt(goal: &str) -> String {
+    format!(
+        "Work toward the following goal, using the shell as needed. \
+         When it is fully accomplished, include the token {GOAL_DONE} in your visible reply.\n\nGoal: {goal}"
+    )
+}
+
+/// The prompt for every turn after the first while a goal is still active.
+fn goal_continue_prompt() -> String {
+    format!(
+        "Continue working toward the active goal. \
+         When it is fully accomplished, include the token {GOAL_DONE} in your visible reply."
+    )
+}
+
 /// True when the model has declared the active goal finished.
 fn goal_completed(text: &str) -> bool {
     text.contains(GOAL_DONE)
@@ -492,6 +512,93 @@ fn print_goal(goal: &Option<String>) {
                 "<none> \u{2014} usage: /goal <text> | /goal show | /goal clear"
             )
         ),
+    }
+}
+
+/// Reprompt the model until it declares the active goal complete, within a
+/// bounded budget (see [`DEFAULT_MAX_GOAL_TURNS`]).
+///
+/// Shared by `/goal <text>` (which starts a new goal) and `/resume` (which
+/// restarts the goal saved with the conversation it just loaded).  Because the
+/// same loop runs in both cases, resuming a conversation with an active goal
+/// puts the model back to work instead of merely printing the saved text.
+///
+/// `primed` is updated the same way as a normal turn: the system prompt is
+/// prepended only when the conversation is brand new.
+#[allow(clippy::too_many_arguments)]
+async fn run_goal_turns(
+    client: &mut api::DeepSeekClient,
+    goal: &mut Option<String>,
+    primed: &mut bool,
+    label: &mut Option<String>,
+    pending_title: &mut Option<String>,
+    thinking: bool,
+    search: bool,
+    sandbox_root: Option<std::path::PathBuf>,
+    debug_pending: bool,
+    interrupt: &Interrupt,
+) {
+    let Some(text) = goal.clone() else { return };
+    let max_turns =
+        env_u64("DS_MAX_GOAL_TURNS", DEFAULT_MAX_GOAL_TURNS as u64).max(1) as usize;
+    let mut turn = 0usize;
+    loop {
+        turn += 1;
+        if turn > max_turns {
+            println!(
+                "{} stopped after {max_turns} turns without {GOAL_DONE}; \
+                 goal kept - continue with /goal <text> or clear with /goal clear",
+                paint("1;33", "[goal paused]")
+            );
+            break;
+        }
+        let base = if turn == 1 {
+            goal_start_prompt(&text)
+        } else {
+            goal_continue_prompt()
+        };
+        let base = if *primed {
+            base
+        } else {
+            *primed = true;
+            format!("{SYSTEM_PROMPT}\n\n{base}")
+        };
+        let message = with_goal(goal, &base);
+        let cfg = TurnConfig {
+            thinking,
+            search,
+            sandbox_root: sandbox_root.clone(),
+            debug_pending,
+            goal,
+        };
+        let completed = match run_turn(client, ReplySource::Message(&message), &cfg, interrupt).await
+        {
+            Ok(TurnResult::Done { completed }) => completed,
+            Ok(TurnResult::Interrupted) => {
+                // Stop reprompting; keep the goal so the user can resume it
+                // with /goal.
+                println!(
+                    "{} goal paused \u{2014} view with /goal show, restart with /goal <text> or drop with /goal clear",
+                    paint("1;33", "[interrupted]")
+                );
+                break;
+            }
+            Err(e) => {
+                eprintln!("{} {e:#}", paint("1;31", "[error]"));
+                break;
+            }
+        };
+        apply_pending_title(client, label, pending_title).await;
+        // The first turn creates the conversation id; record the goal against
+        // it now that one exists.
+        persist_goal(client, goal);
+        if completed {
+            println!("{}", paint("32", "[goal completed]"));
+            *goal = None;
+            persist_goal(client, goal);
+            break;
+        }
+        println!("{} reprompting model (turn {turn})", paint("36", "[goal]"));
     }
 }
 
@@ -1361,6 +1468,22 @@ async fn main() -> Result<()> {
                             println!("{} {}", paint("32", "[resumed]"), entry.display_title());
                             if let Some(g) = &goal {
                                 println!("{} {g}", paint("36", "[goal restored]"));
+                                // Resuming a conversation with an active goal
+                                // means putting the model back to work on it,
+                                // not just printing the saved text.
+                                run_goal_turns(
+                                    &mut client,
+                                    &mut goal,
+                                    &mut primed,
+                                    &mut label,
+                                    &mut pending_title,
+                                    thinking,
+                                    search,
+                                    sandbox_root.clone(),
+                                    debug_pending,
+                                    &interrupt,
+                                )
+                                .await;
                             }
                         }
                         Err(e) => eprintln!(
@@ -1558,81 +1681,21 @@ async fn main() -> Result<()> {
                         persist_goal(&client, &goal);
                         println!("{} {text}", paint("32", "[goal set]"));
                         // Start the model and reprompt it until it marks the
-                        // goal complete, but only within a bounded budget (see
+                        // goal complete, within a bounded budget (see
                         // DEFAULT_MAX_GOAL_TURNS).
-                        let max_turns = env_u64("DS_MAX_GOAL_TURNS", DEFAULT_MAX_GOAL_TURNS as u64)
-                            .max(1) as usize;
-                        let mut turn = 0usize;
-                        loop {
-                            turn += 1;
-                            if turn > max_turns {
-                                println!(
-                                    "{} stopped after {max_turns} turns without {GOAL_DONE}; \
-                                     goal kept - continue with /goal <text> or clear with /goal clear",
-                                    paint("1;33", "[goal paused]")
-                                );
-                                break;
-                            }
-                            let base = if turn == 1 {
-                                format!(
-                                "Work toward the following goal, using the shell as needed. \
-                                 When it is fully accomplished, include the token {GOAL_DONE} in your visible reply.\n\nGoal: {text}"
-                            )
-                            } else {
-                                format!(
-                                "Continue working toward the active goal. \
-                                 When it is fully accomplished, include the token {GOAL_DONE} in your visible reply."
-                            )
-                            };
-                            let base = if primed {
-                                base
-                            } else {
-                                primed = true;
-                                format!("{SYSTEM_PROMPT}\n\n{base}")
-                            };
-                            let message = with_goal(&goal, &base);
-                            let cfg = TurnConfig {
-                                thinking,
-                                search,
-                                sandbox_root: sandbox_root.clone(),
-                                debug_pending,
-                                goal: &goal,
-                            };
-                            let completed = match run_turn(
-                                &mut client,
-                                ReplySource::Message(&message),
-                                &cfg,
-                                &interrupt,
-                            )
-                            .await
-                            {
-                                Ok(TurnResult::Done { completed }) => completed,
-                                Ok(TurnResult::Interrupted) => {
-                                    // Stop reprompting; keep the goal so the
-                                    // user can resume it with /goal.
-                                    println!(
-                                    "{} goal paused \u{2014} view with /goal show, restart with /goal <text> or drop with /goal clear",
-                                    paint("1;33", "[interrupted]")
-                                );
-                                    break;
-                                }
-                                Err(e) => {
-                                    eprintln!("{} {e:#}", paint("1;31", "[error]"));
-                                    break;
-                                }
-                            };
-                            apply_pending_title(&client, &mut label, &mut pending_title).await;
-                            // The first turn creates the conversation id; record
-                            // the goal against it now that one exists.
-                            persist_goal(&client, &goal);
-                            if completed {
-                                println!("{}", paint("32", "[goal completed]"));
-                                goal = None;
-                                persist_goal(&client, &goal);
-                                break;
-                            }
-                            println!("{} reprompting model (turn {turn})", paint("36", "[goal]"));
-                        }
+                        run_goal_turns(
+                            &mut client,
+                            &mut goal,
+                            &mut primed,
+                            &mut label,
+                            &mut pending_title,
+                            thinking,
+                            search,
+                            sandbox_root.clone(),
+                            debug_pending,
+                            &interrupt,
+                        )
+                        .await;
                     }
                 }
                 continue;
@@ -1712,8 +1775,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        goal_completed, parse_args, parse_goal_command, parse_secrets, with_goal, GoalCommand,
-        ParsedArgs, SessionCache,
+        goal_completed, goal_continue_prompt, goal_start_prompt, parse_args, parse_goal_command,
+        parse_secrets, with_goal, GoalCommand, ParsedArgs, SessionCache,
     };
     use crate::sessions;
 
@@ -1736,6 +1799,23 @@ mod tests {
         let g = Some("fix the bug".to_string());
         let msg = format!("[SHELL OUTPUT]{}", "\n=== CMD: ls\nok\n");
         assert!(with_goal(&g, &msg).contains("[ACTIVE GOAL] fix the bug"));
+    }
+
+    #[test]
+    fn goal_start_prompt_names_the_goal_and_the_done_token() {
+        // `/resume` reuses this prompt, so a restored goal actually sends the
+        // model back to work instead of only printing the saved text.
+        let p = goal_start_prompt("fix the bug");
+        assert!(p.contains("Goal: fix the bug"), "{p}");
+        assert!(p.contains("[GOAL COMPLETE]"), "{p}");
+        assert!(p.contains("Work toward the following goal"), "{p}");
+    }
+
+    #[test]
+    fn goal_continue_prompt_asks_to_continue() {
+        let p = goal_continue_prompt();
+        assert!(p.contains("Continue working toward the active goal"), "{p}");
+        assert!(p.contains("[GOAL COMPLETE]"), "{p}");
     }
 
     #[test]
