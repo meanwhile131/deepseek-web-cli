@@ -36,12 +36,13 @@ const GOAL_DONE: &str = "[GOAL COMPLETE]";
 /// again, or raised with `DS_MAX_GOAL_TURNS`.
 const DEFAULT_MAX_GOAL_TURNS: usize = 25;
 
-/// Hard cap on shell round-trips inside a single turn.
+/// Optional hard cap on shell round-trips inside a single turn.
 ///
-/// Every iteration sends one more completion request, so an unproductive
-/// model/tool exchange would otherwise ping-pong forever. Mirrors the goal cap
-/// and is likewise overridable with `DS_MAX_SHELL_ITERS`.
-const DEFAULT_MAX_SHELL_ITERS: usize = 50;
+/// `0` means unlimited, which is the default: the loop keeps running shell
+/// commands for as long as the model emits them, and Ctrl+C always interrupts
+/// the turn. Set `DS_MAX_SHELL_ITERS` to a positive number to impose a request
+/// budget.
+const DEFAULT_MAX_SHELL_ITERS: usize = 0;
 
 const THINK_OPEN: &str = "\u{27EA}THINK\u{27EB}";
 const THINK_CLOSE: &str = "\u{27EA}/THINK\u{27EB}";
@@ -875,12 +876,12 @@ async fn run_turn(
     let mut iter = 0usize;
 
     // Shell loop: keep extracting commands from each reply
-    // (initial + every follow-up) until the model stops - but bounded, since
-    // each iteration costs one completion request.
-    let max_iters = env_u64("DS_MAX_SHELL_ITERS", DEFAULT_MAX_SHELL_ITERS as u64).max(1) as usize;
+    // (initial + every follow-up) until the model stops. The loop is unlimited
+    // by default; `DS_MAX_SHELL_ITERS` can impose an optional request budget.
+    let max_iters = env_u64("DS_MAX_SHELL_ITERS", DEFAULT_MAX_SHELL_ITERS as u64) as usize;
     loop {
         iter += 1;
-        if iter > max_iters {
+        if max_iters != 0 && iter > max_iters {
             println!(
                 "{} stopped after {max_iters} shell round-trips in one turn",
                 paint("1;33", "[shell limit]")

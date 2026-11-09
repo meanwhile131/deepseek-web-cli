@@ -195,7 +195,7 @@ a space to keep it out of the history.
 | `DS_MIN_GAP_MS` | `1500` | minimum spacing between requests |
 | `DS_MAX_RETRIES` | `0` | retries per request before giving up (`0` = unlimited, the default) |
 | `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
-| `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
+| `DS_MAX_SHELL_ITERS` | `0` | shell round-trips per turn before stopping (`0` = unlimited) |
 | `DS_API_BASE` | `https://chat.deepseek.com` | origin API calls go to; point it at a mock server to test without the network |
 | `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |
 | `DS_FORCE_HTTP1` | `0` | pin the HTTP client to HTTP/1.1 (escape hatch for proxies that break h2 negotiation) |
