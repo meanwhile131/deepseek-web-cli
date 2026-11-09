@@ -2,6 +2,7 @@ mod api;
 mod color;
 mod goals;
 mod login;
+mod markdown;
 mod pow;
 mod sessions;
 mod shell;
@@ -640,6 +641,9 @@ fn parse_goal_command(arg: &str) -> GoalCommand {
 struct Renderer {
     in_think: bool,
     buf: String,
+    /// Renders the visible (non-reasoning) text as Markdown. Reasoning stays
+    /// plain so its dimmed styling is not rewritten by the Markdown pass.
+    md: markdown::MarkdownStream,
 }
 
 impl Renderer {
@@ -647,6 +651,7 @@ impl Renderer {
         Self {
             in_think: false,
             buf: String::new(),
+            md: markdown::MarkdownStream::new(),
         }
     }
 
@@ -660,6 +665,7 @@ impl Renderer {
     /// Flush leftovers at end of stream and restore terminal attributes.
     fn finish(&mut self, visible: &mut String, reasoning: &mut String) {
         self.drain(true, visible, reasoning);
+        self.md.finish();
         if self.in_think {
             out(&format!("{}\n", color::reset()));
             self.in_think = false;
@@ -704,14 +710,15 @@ impl Renderer {
         }
     }
 
-    fn emit(&self, s: &str, visible: &mut String, reasoning: &mut String) {
+    fn emit(&mut self, s: &str, visible: &mut String, reasoning: &mut String) {
         if s.is_empty() {
             return;
         }
-        out(s);
         if self.in_think {
+            out(s);
             reasoning.push_str(s);
         } else {
+            self.md.push(s);
             visible.push_str(s);
         }
     }
@@ -723,6 +730,7 @@ impl Drop for Renderer {
     /// terminal attributes so the dim `\x1b[2m` does not leak into the rest
     /// of the session.
     fn drop(&mut self) {
+        self.md.finish();
         if self.in_think {
             out(&format!("{}\n", color::reset()));
             self.in_think = false;

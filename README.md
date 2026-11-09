@@ -117,6 +117,16 @@ matching quotes are accepted. Real environment variables always win. A token
 harvested by `--login`/`/login` is written here with mode `0600`, replacing any
 previous `AUTHORIZATION_TOKEN` line and leaving the rest of the file untouched.
 
+## Markdown rendering
+
+Assistant replies are rendered as Markdown as they stream in: headings,
+bullet and numbered lists, blockquotes, horizontal rules and fenced code
+blocks are styled, and inline `**bold**`, `*italic*`, `~~strikethrough~~`,
+`` `code` `` and `[text](url)` markers are replaced with their styled text
+(links keep the URL in parentheses). The reasoning region and shell output
+are left untouched. Styling is ANSI only and is suppressed when stdout is not
+a terminal or `NO_COLOR` is set; set `CLICOLOR_FORCE=1` to keep it when piping.
+
 ## Commands
 
 | Input | Effect |
