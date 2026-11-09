@@ -10,3 +10,6 @@
 # scratch dirs used when testing cargo-binstall locally
 .binstall-test/
 .scratch/
+
+# throwaway sandboxes created by the e2e tests (tests/e2e.rs)
+deepseek-e2e-*/

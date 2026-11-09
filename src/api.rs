@@ -15,7 +15,32 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
 /// Shared pacing slot: the instant the next request is allowed to start.
 type Slot = Arc<Mutex<Option<Instant>>>;
 
-const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
+/// Default origin of the DeepSeek web app and its API.
+const DEFAULT_API_BASE: &str = "https://chat.deepseek.com";
+
+/// Origin to send API calls to.
+///
+/// Overridable with `DS_API_BASE` so the CLI can be pointed at a local mock
+/// server; the end-to-end tests use exactly that to drive the real binary
+/// without touching the network. Trailing slashes are trimmed so a base of
+/// `http://127.0.0.1:8080/` still produces `.../api/v0/...`.
+fn api_base() -> String {
+    let raw = std::env::var("DS_API_BASE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+    raw.trim_end_matches('/').to_string()
+}
+
+/// Absolute URL for an API `path` (which must start with `/`).
+fn api_url(path: &str) -> String {
+    format!("{}{path}", api_base())
+}
+
+fn completion_url() -> String {
+    api_url("/api/v0/chat/completion")
+}
 /// `target_path` the completion PoW challenge is issued for.
 const COMPLETION_TARGET_PATH: &str = "/api/v0/chat/completion";
 /// Resume generation of an interrupted assistant message.
@@ -23,14 +48,30 @@ const COMPLETION_TARGET_PATH: &str = "/api/v0/chat/completion";
 /// Unlike `chat/completion` this endpoint needs no proof of work: the web
 /// client posts it with a plain bearer token (see the captured HAR), so it is
 /// opened through the same streaming/retry path but without a PoW header.
-const CONTINUE_URL: &str = "https://chat.deepseek.com/api/v0/chat/continue";
-const CHALLENGE_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
-const SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
-const SESSION_PAGE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/fetch_page";
-const SESSION_TITLE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/update_title";
-const SESSION_DELETE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/delete";
-const HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
-const USER_URL: &str = "https://chat.deepseek.com/api/v0/users/current";
+fn continue_url() -> String {
+    api_url("/api/v0/chat/continue")
+}
+fn challenge_url() -> String {
+    api_url("/api/v0/chat/create_pow_challenge")
+}
+fn session_url() -> String {
+    api_url("/api/v0/chat_session/create")
+}
+fn session_page_url() -> String {
+    api_url("/api/v0/chat_session/fetch_page")
+}
+fn session_title_url() -> String {
+    api_url("/api/v0/chat_session/update_title")
+}
+fn session_delete_url() -> String {
+    api_url("/api/v0/chat_session/delete")
+}
+fn history_url() -> String {
+    api_url("/api/v0/chat/history_messages")
+}
+fn user_url() -> String {
+    api_url("/api/v0/users/current")
+}
 
 // ---------------------------------------------------------------------------
 // Rate-limit / transient-failure policy
@@ -579,7 +620,7 @@ async fn fetch_challenge(
         policy,
         slot,
         cancel,
-        CHALLENGE_URL,
+        &challenge_url(),
         &json!({ "target_path": target_path }),
         "create_pow_challenge",
     )
@@ -589,9 +630,9 @@ async fn fetch_challenge(
 }
 
 /// Which streaming endpoint a request goes to, and how to authenticate it.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StreamTarget {
-    url: &'static str,
+    url: String,
     /// Whether a proof-of-work header must be solved and attached.
     pow: bool,
     /// Short name used in retry/error messages, e.g. `completion`.
@@ -616,12 +657,13 @@ async fn open_stream(
     body: &Value,
     target: StreamTarget,
 ) -> Result<Response> {
-    let StreamTarget { url, pow, label } = target;
+    let StreamTarget { url, pow, label } = &target;
+    let (pow, label) = (*pow, *label);
     let mut attempt = 0u32;
     loop {
         pace(slot, policy.min_gap).await;
 
-        let mut req = http.post(url);
+        let mut req = http.post(url.as_str());
         // Browsers send the *conversation* URL as Referer on every fetch issued
         // from an open chat; the site root is only right before one exists.
         let session = body.get("chat_session_id").and_then(|v| v.as_str());
@@ -1293,7 +1335,7 @@ impl DeepSeekClient {
             &self.policy,
             &self.slot,
             &mut cancel,
-            USER_URL,
+            &user_url(),
             &[],
             "users/current",
         )
@@ -1379,7 +1421,7 @@ impl DeepSeekClient {
             &self.policy,
             &self.slot,
             &mut cancel,
-            SESSION_PAGE_URL,
+            &session_page_url(),
             &query,
             "chat_session/fetch_page",
         )
@@ -1412,7 +1454,7 @@ impl DeepSeekClient {
             &self.policy,
             &self.slot,
             &mut cancel,
-            HISTORY_URL,
+            &history_url(),
             &[("chat_session_id", chat_session_id.to_string())],
             "chat/history_messages",
         )
@@ -1443,7 +1485,7 @@ impl DeepSeekClient {
             &self.policy,
             &self.slot,
             &mut cancel,
-            SESSION_TITLE_URL,
+            &session_title_url(),
             &json!({ "chat_session_id": chat_session_id, "title": title }),
             "chat_session/update_title",
         )
@@ -1459,7 +1501,7 @@ impl DeepSeekClient {
             &self.policy,
             &self.slot,
             &mut cancel,
-            SESSION_DELETE_URL,
+            &session_delete_url(),
             &json!({ "chat_session_id": chat_session_id }),
             "chat_session/delete",
         )
@@ -1475,7 +1517,7 @@ impl DeepSeekClient {
                 &self.policy,
                 &self.slot,
                 &mut cancel,
-                SESSION_URL,
+                &session_url(),
                 &json!({}),
                 "chat_session/create",
             )
@@ -1533,7 +1575,7 @@ impl DeepSeekClient {
         self.open_chat_stream(
             body,
             StreamTarget {
-                url: COMPLETION_URL,
+                url: completion_url(),
                 pow: true,
                 label: "completion",
             },
@@ -1579,7 +1621,7 @@ impl DeepSeekClient {
         self.open_chat_stream(
             body,
             StreamTarget {
-                url: CONTINUE_URL,
+                url: continue_url(),
                 pow: false,
                 label: "continue",
             },
@@ -1623,7 +1665,7 @@ impl DeepSeekClient {
             }
 
             'retry: loop {
-                let resp = match open_stream(&http, &policy, &slot, &mut cancel, &body, target).await {
+                let resp = match open_stream(&http, &policy, &slot, &mut cancel, &body, target.clone()).await {
                     Ok(r) => r,
                     Err(e) => {
                         yield Err(e);

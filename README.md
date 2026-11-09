@@ -196,6 +196,7 @@ a space to keep it out of the history.
 | `DS_MAX_RETRIES` | `0` | retries per request before giving up (`0` = unlimited, the default) |
 | `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
 | `DS_MAX_SHELL_ITERS` | `50` | shell round-trips per turn before stopping |
+| `DS_API_BASE` | `https://chat.deepseek.com` | origin API calls go to; point it at a mock server to test without the network |
 | `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |
 | `DS_FORCE_HTTP1` | `0` | pin the HTTP client to HTTP/1.1 (escape hatch for proxies that break h2 negotiation) |
 | `DS_BROWSER_HEADERS` | `1` | send the web app's browser headers (`0`/`false`/`no`/`off` disables) |
@@ -287,6 +288,20 @@ EOF rather than the terminal.
 
 ## Development
 
-    cargo test
+    cargo test              # unit tests + end-to-end tests
     cargo clippy --all-targets
     cargo fmt --check
+
+Unit tests live next to the code they cover (`#[cfg(test)] mod tests`). The
+end-to-end tests in `tests/e2e.rs` run the real `deepseek` binary as a
+subprocess against a small in-process mock of the DeepSeek API, so they cover
+the parts a unit test cannot reach: argument handling and exit codes, the
+startup credential check, the streaming reply loop, shell round-trips, goal
+reprompting, and secrets-file loading.
+
+The mock server is pointed at with `DS_API_BASE`, and the tests run the binary
+in a throwaway `HOME` so they never read or write your real token, history or
+saved goals. Nothing in the suite touches the network. Run just those tests
+with:
+
+    cargo test --test e2e

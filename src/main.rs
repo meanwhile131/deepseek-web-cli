@@ -311,7 +311,10 @@ fn load_user_secrets() -> Option<PathBuf> {
     let path = user_secrets_path()?;
     let contents = std::fs::read_to_string(&path).ok()?;
     for (key, value) in parse_secrets(&contents) {
-        if std::env::var_os(&key).is_none() {
+        // An empty variable counts as unset: a blank `AUTHORIZATION_TOKEN=`
+        // exported by a wrapper script must not shadow the saved token.
+        let already_set = std::env::var_os(&key).is_some_and(|v| !v.is_empty());
+        if !already_set {
             std::env::set_var(&key, &value);
         }
     }
