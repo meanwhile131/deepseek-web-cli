@@ -20,8 +20,14 @@ use tokio::sync::watch;
 /// How to call the shell tool. Shared by the worker's system prompt and the
 /// reviewer's prompt: the reviewer inspects the workspace with the same shell,
 /// so it must be told the same command format the worker is.
-pub(crate) const SHELL_INSTRUCTIONS: &str = r#"Run commands in blocks of exactly this form (never in reasoning, never in markdown fences):
+///
+/// The "no other syntax" clause is load-bearing: the extractor in
+/// [`shell::extract_shell_commands`] only understands the tag form below, so a
+/// model that reaches for a different tool-call syntax (JSON, function calls,
+/// other tag conventions) runs nothing and silently loses its evidence.
+pub(crate) const SHELL_INSTRUCTIONS: &str = r#"The ONLY way to run a command is a block of exactly this form (never in reasoning, never in markdown fences):
 <shell>command goes here</shell>
+Any other tool-call syntax (JSON, function calls, other tag names) is ignored and runs nothing.
 One command per block; batch several per reply. Blocks run automatically; output returns as [SHELL OUTPUT].
 Commands run in the current directory. The rest of the filesystem is read-only (bubblewrap/sandbox-exec), so do not write outside it; HOME is your real home directory and is read-only there."#;
 

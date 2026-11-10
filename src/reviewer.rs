@@ -144,6 +144,8 @@ mod tests {
         assert!(p.contains("You have a local shell"), "{p}");
         assert!(p.contains(crate::SHELL_INSTRUCTIONS), "{p}");
         assert!(p.contains("<shell>"), "{p}");
+        assert!(p.contains("ONLY way to run a command"), "{p}");
+        assert!(p.contains("is ignored and runs nothing"), "{p}");
         assert!(p.contains("[SHELL OUTPUT]"), "{p}");
     }
 
