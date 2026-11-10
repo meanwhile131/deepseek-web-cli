@@ -653,6 +653,41 @@ fn goal_is_reprompted_until_the_reviewer_confirms_completion() {
 }
 
 #[test]
+fn a_reviewer_using_dsml_tool_calls_still_runs_commands() {
+    // Exactly the shape a reviewer emitted when it ignored the instructions:
+    // a DSML invoke/parameter tool call with fullwidth bars.
+    let bar = "｜｜";
+    let mock = mock_api(move |req, _n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        if prompt.contains("=== CMD:") && !prompt.contains("[ACTIVE GOAL]") {
+            sse_reply("Checked.\nVERDICT: ACHIEVED")
+        } else if is_review(&prompt) {
+            sse_reply(&format!(
+                "<{bar}DSML{bar} calls>\n<{bar}DSML{bar} invoke name=\"shell\">\n<{bar}DSML{bar} parameter name=\"command\" string=\"true\">echo e2e-dsml-ran</{bar}DSML{bar} parameter>\n</{bar}DSML{bar} invoke>"
+            ))
+        } else {
+            sse_reply("done [GOAL COMPLETE]")
+        }
+    });
+    let sb = Sandbox::new("goal-dsml");
+
+    let out = run(
+        &sb,
+        &[],
+        &[("DS_API_BASE", &mock.base)],
+        "/goal tidy the repo\nexit\n",
+    );
+    let text = stdout(&out);
+
+    assert_contains(&text, "e2e-dsml-ran", "DSML command output");
+    assert_contains(
+        &text,
+        "[goal completed]",
+        "goal completes after real evidence",
+    );
+}
+
+#[test]
 fn a_reviewer_using_an_alternate_tag_still_runs_commands() {
     // The documented tag is the block form, but a model can reach for a short
     // alias. It must still run, or the reviewer has no evidence at all.
