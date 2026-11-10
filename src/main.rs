@@ -29,7 +29,9 @@ use tokio::sync::watch;
 /// loses its evidence.
 pub(crate) const SHELL_INSTRUCTIONS: &str = r#"The ONLY way to run a command is a block of exactly this form (never in reasoning, never in markdown fences):
 <shell>command goes here</shell>
-Do not use any other tool-call syntax (JSON, function calls, other tag names): it may be ignored, and then nothing runs.
+Do not use any other tool-call syntax. In particular do NOT emit DeepSeek's native DSML
+tool calls (invoke/parameter elements) or JSON tool calls: this harness does not execute
+them, so nothing runs.
 One command per block; batch several per reply. Blocks run automatically; output returns as [SHELL OUTPUT].
 For example, to inspect the repo:
 <shell>git log --oneline -3 && git status --short</shell>

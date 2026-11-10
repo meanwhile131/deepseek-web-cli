@@ -161,6 +161,7 @@ mod tests {
         assert!(p.contains("<shell>"), "{p}");
         assert!(p.contains("ONLY way to run a command"), "{p}");
         assert!(p.contains("nothing runs"), "{p}");
+        assert!(p.contains("DSML"), "{p}");
         // A worked example is included, not just a placeholder.
         assert!(p.contains("git log --oneline -3"), "{p}");
         // A final reminder, near the verdict request, keeps the model on
