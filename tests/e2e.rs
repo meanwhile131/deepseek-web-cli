@@ -607,7 +607,7 @@ fn goal_is_reprompted_until_the_reviewer_confirms_completion() {
     let out = run(
         &sb,
         &[],
-        &[("DS_API_BASE", &mock.base), ("DS_MAX_GOAL_TURNS", "8")],
+        &[("DS_API_BASE", &mock.base)],
         "/goal tidy the repo\nexit\n",
     );
     let text = stdout(&out);
@@ -626,7 +626,7 @@ fn goal_is_reprompted_until_the_reviewer_confirms_completion() {
     assert_contains(&text, "[goal completed]", "goal completion");
     assert!(
         !text.contains("[goal paused]"),
-        "goal should finish inside the turn budget: {text}"
+        "goal should finish without pausing: {text}"
     );
 
     let completions = mock.requests_to("/api/v0/chat/completion");
@@ -677,12 +677,63 @@ fn an_unverified_claim_does_not_complete_the_goal() {
         !text.contains("[goal completed]"),
         "an unverified claim must not close the goal: {text}"
     );
-    assert_contains(&text, "[goal paused]", "goal stays open after the budget");
+    assert_contains(
+        &text,
+        "[goal paused]",
+        "goal stays open after the opt-in turn budget",
+    );
 
     let store = std::fs::read_to_string(sb.file("goals.json")).unwrap_or_default();
     assert!(
         store.contains("tidy the repo"),
         "the unfinished goal must stay in the store: {store}"
+    );
+}
+
+#[test]
+fn goal_turns_are_unlimited_by_default() {
+    // 40 worker turns is far beyond the old 25-turn cap.  With no
+    // DS_MAX_GOAL_TURNS set the loop must keep going until the reviewer
+    // confirms completion.
+    let mock = mock_api(|req, n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        if is_review(&prompt) {
+            sse_reply("Verified.\nVERDICT: ACHIEVED")
+        } else if n >= 39 {
+            sse_reply("finally done [GOAL COMPLETE]")
+        } else {
+            sse_reply("still working on it")
+        }
+    });
+    let sb = Sandbox::new("goal-unlimited");
+
+    let out = run(
+        &sb,
+        &[],
+        &[
+            ("DS_API_BASE", &mock.base),
+            // 40 sequential requests: don't spend a minute on request spacing.
+            ("DS_MIN_GAP_MS", "1"),
+        ],
+        "/goal tidy the repo\nexit\n",
+    );
+    let text = stdout(&out);
+
+    assert!(
+        !text.contains("[goal paused]"),
+        "goal must not pause: {text}"
+    );
+    assert_contains(
+        &text,
+        "[goal] reprompting model (turn 39)",
+        "39+ turns ran (well past the old 25-turn cap)",
+    );
+    assert_contains(&text, "[goal completed]", "goal eventually completes");
+
+    let store = std::fs::read_to_string(sb.file("goals.json")).unwrap_or_default();
+    assert!(
+        !store.contains("tidy the repo"),
+        "completed goal must not stay in the store: {store}"
     );
 }
 

@@ -26,16 +26,14 @@ Commands run in the current directory. The rest of the filesystem is read-only (
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";
 
-/// Hard cap on consecutive goal turns before handing control back to the user.
+/// Default cap on consecutive goal turns; `0` means unlimited.
 ///
-/// This used to be unlimited: `/goal` would reprompt the model forever until it
-/// emitted the completion token, issuing a fresh completion request each time.
-/// A model that never emits the token (or a goal that cannot be finished)
-/// turned that into an endless request loop - the exact traffic pattern that
-/// gets an account flagged for botting. The cap is a request budget, not a
-/// deadline: a genuinely long goal can be continued by running `/goal <text>`
-/// again, or raised with `DS_MAX_GOAL_TURNS`.
-const DEFAULT_MAX_GOAL_TURNS: usize = 25;
+/// By default `/goal` keeps reprompting the model until it emits the completion
+/// token and the reviewer verifies it, so a goal has no fixed turn budget.
+/// Ctrl+C always interrupts the loop and keeps the goal for later. Set
+/// `DS_MAX_GOAL_TURNS` to a positive number to impose a request budget (useful
+/// for unattended runs or accounts sensitive to request volume).
+const DEFAULT_MAX_GOAL_TURNS: usize = 0;
 
 /// Optional hard cap on shell round-trips inside a single turn.
 ///
@@ -611,8 +609,8 @@ impl Reviewer {
     }
 }
 
-/// Drive the active goal to a *verified* completion, within a bounded budget
-/// (see [`DEFAULT_MAX_GOAL_TURNS`]).
+/// Drive the active goal to a *verified* completion, with no turn limit unless
+/// `DS_MAX_GOAL_TURNS` imposes one (see [`DEFAULT_MAX_GOAL_TURNS`]).
 ///
 /// Shared by `/goal <text>` (which starts a new goal) and `/resume` (which
 /// restarts the goal saved with the conversation it just loaded).  Because the
@@ -642,7 +640,7 @@ async fn run_goal_turns(
     interrupt: &Interrupt,
 ) {
     let Some(text) = goal.clone() else { return };
-    let max_turns = env_u64("DS_MAX_GOAL_TURNS", DEFAULT_MAX_GOAL_TURNS as u64).max(1) as usize;
+    let max_turns = env_u64("DS_MAX_GOAL_TURNS", DEFAULT_MAX_GOAL_TURNS as u64) as usize;
     // Feedback from a rejected review, sent to the worker instead of the
     // generic "keep going" prompt.
     let mut feedback: Option<String> = None;
@@ -650,7 +648,7 @@ async fn run_goal_turns(
     let mut turn = 0usize;
     loop {
         turn += 1;
-        if turn > max_turns {
+        if max_turns != 0 && turn > max_turns {
             println!(
                 "{} stopped after {max_turns} turns without a verified {GOAL_DONE}; \
                  goal kept - continue with /goal <text> or clear with /goal clear",
@@ -1930,7 +1928,7 @@ async fn main() -> Result<()> {
                         persist_goal(&client, &goal);
                         println!("{} {text}", paint("32", "[goal set]"));
                         // Start the model and reprompt it until it marks the
-                        // goal complete, within a bounded budget (see
+                        // goal complete (no turn limit by default; see
                         // DEFAULT_MAX_GOAL_TURNS).
                         run_goal_turns(
                             &mut client,
