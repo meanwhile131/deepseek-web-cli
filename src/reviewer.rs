@@ -65,6 +65,11 @@ pub fn review_prompt(goal: &str, report: &str) -> String {
          claim without evidence is not an achievement, and partial work is not an\n\
          achievement.\n\
          \n\
+         Command format reminder: emit commands only as\n\
+         <shell>command</shell> blocks. Do not use DSML, JSON tool calls,\n\
+         or any other tag - those are not executed here, and a review\n\
+         that runs nothing must say so rather than guess.\n\
+         \n\
          Be concise. Say what you checked and what is missing, then finish your reply with\n\
          exactly one line, on its own:\n\
          \n\
@@ -158,6 +163,9 @@ mod tests {
         assert!(p.contains("nothing runs"), "{p}");
         // A worked example is included, not just a placeholder.
         assert!(p.contains("git log --oneline -3"), "{p}");
+        // A final reminder, near the verdict request, keeps the model on
+        // the documented form at the point it actually acts.
+        assert!(p.contains("Command format reminder"), "{p}");
         assert!(p.contains("[SHELL OUTPUT]"), "{p}");
     }
 
