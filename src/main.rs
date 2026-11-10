@@ -17,11 +17,22 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::sync::watch;
 
-const SYSTEM_PROMPT: &str = r#"You are a helpful assistant with a local shell.
-Run commands in blocks of exactly this form (never in reasoning, never in markdown fences):
+/// How to call the shell tool. Shared by the worker's system prompt and the
+/// reviewer's prompt: the reviewer inspects the workspace with the same shell,
+/// so it must be told the same command format the worker is.
+pub(crate) const SHELL_INSTRUCTIONS: &str = r#"Run commands in blocks of exactly this form (never in reasoning, never in markdown fences):
 <shell>command goes here</shell>
 One command per block; batch several per reply. Blocks run automatically; output returns as [SHELL OUTPUT].
 Commands run in the current directory. The rest of the filesystem is read-only (bubblewrap/sandbox-exec), so do not write outside it; HOME is your real home directory and is read-only there."#;
+
+/// The worker's system prompt: persona plus the shared shell instructions.
+///
+/// Built with `format!` rather than `concat!` because the shell instructions
+/// live in one `const` shared with the reviewer, and `concat!` only accepts
+/// literals.
+fn system_prompt() -> String {
+    format!("You are a helpful assistant with a local shell.\n{SHELL_INSTRUCTIONS}")
+}
 
 /// Token the model must include in its visible reply once the goal is done.
 const GOAL_DONE: &str = "[GOAL COMPLETE]";
@@ -673,7 +684,7 @@ async fn run_goal_turns(
             base
         } else {
             *primed = true;
-            format!("{SYSTEM_PROMPT}\n\n{base}")
+            format!("{}\n\n{base}", system_prompt())
         };
         let message = with_goal(goal, &base);
         let cfg = TurnConfig {
@@ -1961,7 +1972,7 @@ async fn main() -> Result<()> {
                     input.clone()
                 } else {
                     primed = true;
-                    format!("{SYSTEM_PROMPT}\n\n{input}")
+                    format!("{}\n\n{input}", system_prompt())
                 };
                 let message = with_goal(&goal, &message);
                 let cfg = TurnConfig {

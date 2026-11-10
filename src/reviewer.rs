@@ -49,6 +49,8 @@ pub fn review_prompt(goal: &str, report: &str) -> String {
          is possible from here. The goal text is the standard; a claim without evidence is not\n\
          an achievement, and partial work is not an achievement.\n\
          \n\
+         {SHELL_INSTRUCTIONS}\n\
+         \n\
          Be concise. Say what you checked and what is missing, then finish your reply with\n\
          exactly one line, on its own:\n\
          \n\
@@ -58,7 +60,8 @@ pub fn review_prompt(goal: &str, report: &str) -> String {
          \n\
          {VERDICT_NOT_ACHIEVED}\n\
          \n\
-         if it has not."
+         if it has not.",
+        SHELL_INSTRUCTIONS = crate::SHELL_INSTRUCTIONS
     )
 }
 
@@ -126,6 +129,17 @@ mod tests {
         assert!(p.contains(VERDICT_ACHIEVED), "{p}");
         assert!(p.contains(VERDICT_NOT_ACHIEVED), "{p}");
         assert!(p.contains("I fixed it"), "{p}");
+    }
+
+    #[test]
+    fn review_prompt_tells_the_reviewer_how_to_run_shell_commands() {
+        // The reviewer inspects the workspace with the same shell the worker
+        // uses; without the command format it cannot act on "inspect the
+        // workspace" and can only judge the report.
+        let p = review_prompt("fix the bug", "I fixed it [GOAL COMPLETE]");
+        assert!(p.contains(crate::SHELL_INSTRUCTIONS), "{p}");
+        assert!(p.contains("<shell>"), "{p}");
+        assert!(p.contains("[SHELL OUTPUT]"), "{p}");
     }
 
     #[test]

@@ -579,6 +579,12 @@ fn goal_is_reprompted_until_the_reviewer_confirms_completion() {
                 prompt.contains("Goal: tidy the repo"),
                 "reviewer must be told the goal: {prompt}"
             );
+            // The reviewer inspects the workspace with the same shell the
+            // worker uses, so it must be told the command format.
+            assert!(
+                prompt.contains("<shell>") && prompt.contains("[SHELL OUTPUT]"),
+                "reviewer must be told how to run commands: {prompt}"
+            );
             if prompt.contains("removed the cruft") {
                 // Second review: the worker's report fixed the finding.
                 sse_reply("Checked the tree; clean.\nVERDICT: ACHIEVED")
