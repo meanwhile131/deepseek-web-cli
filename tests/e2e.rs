@@ -832,6 +832,51 @@ fn a_reviewer_using_a_native_tool_call_still_runs_commands() {
 }
 
 #[test]
+fn a_verdictless_review_is_nudged_once_in_the_same_conversation() {
+    // The reviewer announces it will inspect the workspace but stops without
+    // running anything or concluding. One nudge must follow in the same
+    // conversation, and the verdict it then gives must be honoured.
+    let mock = mock_api(|req, _n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        if prompt.contains("You did not finish with a verdict") {
+            sse_reply("I could not run commands.\nVERDICT: NOT ACHIEVED - unverified")
+        } else if is_review(&prompt) {
+            sse_reply("I'll start by inspecting the workspace.")
+        } else {
+            sse_reply("done [GOAL COMPLETE]")
+        }
+    });
+    let sb = Sandbox::new("goal-nudge");
+
+    let out = run(
+        &sb,
+        &[],
+        &[("DS_API_BASE", &mock.base), ("DS_MAX_GOAL_TURNS", "2")],
+        "/goal tidy the repo\nexit\n",
+    );
+    let text = stdout(&out);
+
+    // The nudge produced a real verdict, so the worker got the findings.
+    assert_contains(
+        &text,
+        "unverified",
+        "worker receives the reviewer's findings",
+    );
+
+    let prompts: Vec<String> = mock
+        .requests_to("/api/v0/chat/completion")
+        .iter()
+        .map(|r| r.json()["prompt"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains("You did not finish with a verdict")),
+        "a verdictless review must be nudged: {prompts:#?}"
+    );
+}
+
+#[test]
 fn an_unverified_claim_does_not_complete_the_goal() {
     // The worker always claims completion; the reviewer never gives a
     // readable verdict.  The goal must stay open (and persisted).

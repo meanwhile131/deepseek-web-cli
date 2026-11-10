@@ -14,6 +14,15 @@ pub const VERDICT_ACHIEVED: &str = "VERDICT: ACHIEVED";
 /// Verdict line that rejects a completion claim.
 pub const VERDICT_NOT_ACHIEVED: &str = "VERDICT: NOT ACHIEVED";
 
+/// Sent when a review ends without a verdict, before the claim is rejected.
+///
+/// A reviewer sometimes announces "I will inspect the workspace" and stops
+/// without running anything or concluding. One nudge in the same conversation
+/// is cheaper - and kinder to the worker - than rejecting on an empty review.
+pub const NO_COMMAND_NUDGE: &str = "Run the commands you need as a block of the form \
+the instructions show, read the output, then state your verdict. If you cannot run \
+any command, say what you could not check and still give a verdict.";
+
 /// Reminder appended to the reviewer's shell-output follow-up turns.
 ///
 /// A review runs in a conversation with no system prompt, and follow-up turns
@@ -184,6 +193,14 @@ mod tests {
         assert!(p.contains("Goal: fix the bug"), "{p}");
         assert!(p.contains("tests fail"), "{p}");
         assert!(p.contains("[GOAL COMPLETE]"), "{p}");
+    }
+
+    #[test]
+    fn no_command_nudge_points_at_the_block_form() {
+        // The nudge is what gets a stalled reviewer moving; it must name the
+        // documented form, not leave it to the (long) instructions above.
+        assert!(NO_COMMAND_NUDGE.contains("block"), "{NO_COMMAND_NUDGE}");
+        assert!(NO_COMMAND_NUDGE.contains("verdict"), "{NO_COMMAND_NUDGE}");
     }
 
     #[test]

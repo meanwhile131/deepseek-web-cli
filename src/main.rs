@@ -634,10 +634,26 @@ impl Reviewer {
             goal: &no_goal,
             follow_up_suffix: Some(reviewer::VERDICT_REMINDER),
         };
-        match run_turn(&mut client, ReplySource::Message(&prompt), &cfg, interrupt).await? {
-            TurnResult::Done { report, .. } => Ok(report),
-            TurnResult::Interrupted => anyhow::bail!("review interrupted"),
+        let mut reply =
+            match run_turn(&mut client, ReplySource::Message(&prompt), &cfg, interrupt).await? {
+                TurnResult::Done { report, .. } => report,
+                TurnResult::Interrupted => anyhow::bail!("review interrupted"),
+            };
+        // A reviewer can stop at "I'll inspect the workspace" without actually
+        // running anything or giving a verdict. Nudge it once in the same
+        // conversation instead of bouncing an empty review back to the worker.
+        if reviewer::parse_verdict(&reply).is_none() {
+            let nudge = format!(
+                "You did not finish with a verdict. {}\n\n{}",
+                reviewer::NO_COMMAND_NUDGE,
+                reviewer::VERDICT_REMINDER
+            );
+            match run_turn(&mut client, ReplySource::Message(&nudge), &cfg, interrupt).await? {
+                TurnResult::Done { report, .. } => reply = report,
+                TurnResult::Interrupted => anyhow::bail!("review interrupted"),
+            }
         }
+        Ok(reply)
     }
 }
 
