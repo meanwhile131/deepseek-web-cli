@@ -660,6 +660,12 @@ fn a_reviewer_using_dsml_tool_calls_still_runs_commands() {
     let mock = mock_api(move |req, _n| {
         let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
         if prompt.contains("=== CMD:") && !prompt.contains("[ACTIVE GOAL]") {
+            // The reviewer's follow-up has no system prompt, so it must be
+            // reminded how to finish or it may answer without a verdict.
+            assert!(
+                prompt.contains("Reminder: you are the reviewer"),
+                "follow-up must carry the verdict reminder: {prompt}"
+            );
             sse_reply("Checked.\nVERDICT: ACHIEVED")
         } else if is_review(&prompt) {
             sse_reply(&format!(

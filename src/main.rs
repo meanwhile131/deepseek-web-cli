@@ -621,6 +621,7 @@ impl Reviewer {
             sandbox_root: sandbox_root.clone(),
             debug_pending: false,
             goal: &no_goal,
+            follow_up_suffix: Some(reviewer::VERDICT_REMINDER),
         };
         match run_turn(&mut client, ReplySource::Message(&prompt), &cfg, interrupt).await? {
             TurnResult::Done { report, .. } => Ok(report),
@@ -702,6 +703,7 @@ async fn run_goal_turns(
             sandbox_root: sandbox_root.clone(),
             debug_pending,
             goal,
+            follow_up_suffix: None,
         };
         let (claim, report) = match run_turn(
             client,
@@ -1083,6 +1085,12 @@ struct TurnConfig<'a> {
     sandbox_root: Option<std::path::PathBuf>,
     debug_pending: bool,
     goal: &'a Option<String>,
+    /// Appended to every shell-output follow-up in this turn.
+    ///
+    /// The reviewer needs this: its conversation has no system prompt and its
+    /// follow-up turns carry only the command output, so without a reminder it
+    /// can finish without the verdict line and the claim goes unverified.
+    follow_up_suffix: Option<&'a str>,
 }
 
 async fn run_turn(
@@ -1197,7 +1205,11 @@ async fn run_turn(
             break;
         }
 
-        let follow_up = with_goal(goal, &format!("[SHELL OUTPUT]{combined}"));
+        let mut follow_up = with_goal(goal, &format!("[SHELL OUTPUT]{combined}"));
+        if let Some(suffix) = cfg.follow_up_suffix {
+            follow_up.push_str("\n\n");
+            follow_up.push_str(suffix);
+        }
         let (v, r) = tokio::select! {
             r = stream_reply(client, ReplySource::Message(&follow_up), thinking, search) => r?,
             _ = rx.changed() => {
@@ -1915,6 +1927,7 @@ async fn main() -> Result<()> {
                     sandbox_root: sandbox_root.clone(),
                     debug_pending,
                     goal: &goal,
+                    follow_up_suffix: None,
                 };
                 match run_turn(&mut client, ReplySource::Continue, &cfg, &interrupt).await {
                     Ok(TurnResult::Done { claim, report }) => {
@@ -1990,6 +2003,7 @@ async fn main() -> Result<()> {
                     sandbox_root: sandbox_root.clone(),
                     debug_pending,
                     goal: &goal,
+                    follow_up_suffix: None,
                 };
                 match run_turn(
                     &mut client,

@@ -14,6 +14,16 @@ pub const VERDICT_ACHIEVED: &str = "VERDICT: ACHIEVED";
 /// Verdict line that rejects a completion claim.
 pub const VERDICT_NOT_ACHIEVED: &str = "VERDICT: NOT ACHIEVED";
 
+/// Reminder appended to the reviewer's shell-output follow-up turns.
+///
+/// A review runs in a conversation with no system prompt, and follow-up turns
+/// carry only `[SHELL OUTPUT]...`. Without this, a reviewer that ran a command
+/// could answer with findings and no verdict line, and the claim would stay
+/// unverified forever.
+pub const VERDICT_REMINDER: &str = "Reminder: you are the reviewer. When you have \
+checked enough, finish with exactly one line: VERDICT: ACHIEVED if the goal is \
+genuinely achieved, or VERDICT: NOT ACHIEVED if it is not.";
+
 /// How much of the worker's final report is quoted back to the reviewer.
 /// Reports can be long; only the claim itself needs to be checked.
 const MAX_REPORT_CHARS: usize = 8_000;
@@ -165,6 +175,20 @@ mod tests {
         assert!(p.contains("Goal: fix the bug"), "{p}");
         assert!(p.contains("tests fail"), "{p}");
         assert!(p.contains("[GOAL COMPLETE]"), "{p}");
+    }
+
+    #[test]
+    fn verdict_reminder_names_both_verdicts() {
+        // Appended to the reviewer's shell follow-ups, which carry no system
+        // prompt; without both lines a reply could be unreadable.
+        assert!(
+            VERDICT_REMINDER.contains(VERDICT_ACHIEVED),
+            "{VERDICT_REMINDER}"
+        );
+        assert!(
+            VERDICT_REMINDER.contains("VERDICT: NOT ACHIEVED"),
+            "{VERDICT_REMINDER}"
+        );
     }
 
     #[test]
