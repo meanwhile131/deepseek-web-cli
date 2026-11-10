@@ -422,6 +422,70 @@ fn extract_tool_call_commands(text: &str) -> Vec<ShellCommand> {
     cmds
 }
 
+/// Extract commands from JSON tool-call blocks such as
+///
+/// ```text
+/// <tool_call>
+/// {"name":"shell","arguments":{"command":"ls -la"}}
+/// </tool_call>
+/// ```
+///
+/// Models drift between plain function calls, Anthropic-style `arguments`
+/// objects and OpenAI-style `parameters`. Rather than depend on a JSON parser
+/// (the surrounding text is often not valid JSON), look for the `"command"`
+/// key and read its string value.
+fn extract_json_tool_commands(text: &str) -> Vec<ShellCommand> {
+    let mut cmds = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("\"command\"") {
+        let after = &rest[i + "\"command\"".len()..];
+        let after = after.trim_start();
+        let Some(after) = after.strip_prefix(':') else {
+            rest = after;
+            continue;
+        };
+        let after = after.trim_start();
+        let Some(quote) = after.chars().next() else {
+            break;
+        };
+        if quote != '"' && quote != '\'' {
+            rest = after;
+            continue;
+        }
+        // Read the quoted value, honouring backslash escapes.
+        let mut value = String::new();
+        let mut escaped = false;
+        let mut consumed = 1;
+        let mut closed = false;
+        for ch in after[1..].chars() {
+            consumed += ch.len_utf8();
+            if escaped {
+                value.push(match ch {
+                    'n' => '\n',
+                    't' => '\t',
+                    other => other,
+                });
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                closed = true;
+                break;
+            } else {
+                value.push(ch);
+            }
+        }
+        if closed && !value.trim().is_empty() {
+            cmds.push(ShellCommand {
+                cmd: value.trim().to_string(),
+                timeout: default_timeout(),
+            });
+        }
+        rest = &after[consumed..];
+    }
+    cmds
+}
+
 /// Opening tag names accepted for a command block.
 ///
 /// `<shell>` is the documented form. The aliases exist because models drift
@@ -493,7 +557,10 @@ pub fn extract_shell_commands(text: &str) -> Vec<ShellCommand> {
     }
     // Tolerate the native tool-call shape as well, so a model that reaches
     // for it instead of the tag form still runs its commands.
-    for cmd in extract_tool_call_commands(text) {
+    for cmd in extract_tool_call_commands(text)
+        .into_iter()
+        .chain(extract_json_tool_commands(text))
+    {
         if !cmds.iter().any(|c| c.cmd == cmd.cmd) {
             cmds.push(cmd);
         }
@@ -513,6 +580,25 @@ mod tests {
     /// Build a shell block without writing the literal tag pair.
     fn block(attrs: &str, body: &str) -> String {
         format!("{OPEN}{attrs}\x3e{body}{CLOSE}")
+    }
+
+    #[test]
+    fn extracts_json_tool_call() {
+        // The exact shape a reviewer emitted: a JSON tool-call block.
+        let text = concat!(
+            "<tool_call>\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd && ls -la\"}}\n",
+            "</tool_call>"
+        );
+        let cmds = extract_shell_commands(text);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].cmd, "pwd && ls -la");
+
+        // Escaped quotes and newlines survive.
+        let text = r#"{"parameters":{"command":"printf \"a\"\nls"}}"#;
+        let cmds = extract_shell_commands(text);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].cmd, "printf \"a\"\nls");
     }
 
     #[test]
@@ -558,6 +644,13 @@ mod tests {
         let cmds = extract_shell_commands(text);
         assert_eq!(cmds.len(), 1, "{cmds:?}");
         assert_eq!(cmds[0].cmd, "pwd && ls");
+    }
+
+    #[test]
+    fn a_non_json_command_key_is_not_a_false_positive() {
+        // Prose mentioning the key must not become a command.
+        assert!(extract_shell_commands("\"command\": not quoted here").is_empty());
+        assert!(extract_shell_commands("the \"command\" key is undocumented").is_empty());
     }
 
     #[test]

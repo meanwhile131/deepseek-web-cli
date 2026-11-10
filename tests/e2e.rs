@@ -653,6 +653,45 @@ fn goal_is_reprompted_until_the_reviewer_confirms_completion() {
 }
 
 #[test]
+fn a_reviewer_using_a_json_tool_call_still_runs_commands() {
+    // Another drift: a JSON tool-call block instead of the documented form.
+    let mock = mock_api(|req, _n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        if prompt.contains("=== CMD:") && !prompt.contains("[ACTIVE GOAL]") {
+            assert!(
+                prompt.contains("Reminder: you are the reviewer"),
+                "follow-up must carry the verdict reminder: {prompt}"
+            );
+            sse_reply("Checked.\nVERDICT: ACHIEVED")
+        } else if is_review(&prompt) {
+            sse_reply(concat!(
+                "<tool_call>\n",
+                "{\"name\":\"shell\",\"arguments\":{\"command\":\"echo e2e-json-ran\"}}\n",
+                "</tool_call>"
+            ))
+        } else {
+            sse_reply("done [GOAL COMPLETE]")
+        }
+    });
+    let sb = Sandbox::new("goal-json-tool-call");
+
+    let out = run(
+        &sb,
+        &[],
+        &[("DS_API_BASE", &mock.base)],
+        "/goal tidy the repo\nexit\n",
+    );
+    let text = stdout(&out);
+
+    assert_contains(&text, "e2e-json-ran", "JSON tool-call command output");
+    assert_contains(
+        &text,
+        "[goal completed]",
+        "goal completes after real evidence",
+    );
+}
+
+#[test]
 fn a_reviewer_using_dsml_tool_calls_still_runs_commands() {
     // Exactly the shape a reviewer emitted when it ignored the instructions:
     // a DSML invoke/parameter tool call with fullwidth bars.

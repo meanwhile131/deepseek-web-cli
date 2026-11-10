@@ -24,8 +24,9 @@ use tokio::sync::watch;
 /// The "no other syntax" clause is load-bearing: the documented form below is
 /// the one that reliably runs. [`shell::extract_shell_commands`] also recovers
 /// a few drifted forms (`<cmd>`, `<bash>`, native `invoke name="shell"` tool
-/// calls) as a safety net, but those are best-effort - a model that invents
-/// its own syntax runs nothing and silently loses its evidence.
+/// calls, JSON `"command"` arguments) as a safety net, but those are
+/// best-effort - a model that invents its own syntax runs nothing and silently
+/// loses its evidence.
 pub(crate) const SHELL_INSTRUCTIONS: &str = r#"The ONLY way to run a command is a block of exactly this form (never in reasoning, never in markdown fences):
 <shell>command goes here</shell>
 Do not use any other tool-call syntax (JSON, function calls, other tag names): it may be ignored, and then nothing runs.
