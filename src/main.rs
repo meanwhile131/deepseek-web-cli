@@ -30,6 +30,8 @@ pub(crate) const SHELL_INSTRUCTIONS: &str = r#"The ONLY way to run a command is 
 <shell>command goes here</shell>
 Do not use any other tool-call syntax (JSON, function calls, other tag names): it may be ignored, and then nothing runs.
 One command per block; batch several per reply. Blocks run automatically; output returns as [SHELL OUTPUT].
+For example, to inspect the repo:
+<shell>git log --oneline -3 && git status --short</shell>
 Commands run in the current directory. The rest of the filesystem is read-only (bubblewrap/sandbox-exec), so do not write outside it; HOME is your real home directory and is read-only there."#;
 
 /// The worker's system prompt: persona plus the shared shell instructions.

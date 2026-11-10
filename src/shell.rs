@@ -516,6 +516,20 @@ mod tests {
     }
 
     #[test]
+    fn extracts_dsml_style_tool_call() {
+        // The shape an agent session emits verbatim, fullwidth bars and all.
+        let text = concat!(
+            "<｜｜DSML｜｜ calls>\n",
+            "<｜｜DSML｜｜ invoke name=\"shell\">\n",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">pwd && ls</｜｜DSML｜｜ parameter>\n",
+            "</｜｜DSML｜｜ invoke>"
+        );
+        let cmds = extract_shell_commands(text);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].cmd, "pwd && ls");
+    }
+
+    #[test]
     fn accepts_common_tag_aliases() {
         // Models drift into other tag names; a reviewer using one must still
         // be able to run its commands.
