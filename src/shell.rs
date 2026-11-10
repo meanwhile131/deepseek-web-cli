@@ -583,6 +583,23 @@ mod tests {
     }
 
     #[test]
+    fn extracts_dsml_with_extra_parameters() {
+        // The invoke can carry more than one parameter (e.g. a workdir); the
+        // command must still be read, and the extra one ignored.
+        let text = concat!(
+            "<｜｜DSML｜｜ calls>\n",
+            "<｜｜DSML｜｜ invoke name=\"shell\">\n",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">pwd && ls</｜｜DSML｜｜ parameter>\n",
+            "<｜｜DSML｜｜ parameter name=\"workdir\" string=\"true\">.</｜｜DSML｜｜ parameter>\n",
+            "</｜｜DSML｜｜ invoke>\n",
+            "</｜｜DSML｜｜ calls>"
+        );
+        let cmds = extract_shell_commands(text);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].cmd, "pwd && ls");
+    }
+
+    #[test]
     fn extracts_bare_dsml_invoke_without_calls_wrapper() {
         // The invoke element can arrive without the surrounding "calls" line.
         let text = concat!(
