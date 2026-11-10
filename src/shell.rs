@@ -583,6 +583,19 @@ mod tests {
     }
 
     #[test]
+    fn extracts_bare_dsml_invoke_without_calls_wrapper() {
+        // The invoke element can arrive without the surrounding "calls" line.
+        let text = concat!(
+            "<｜｜DSML｜｜ invoke name=\"shell\">\n",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">pwd && ls -la</｜｜DSML｜｜ parameter>\n",
+            "</｜｜DSML｜｜ invoke>"
+        );
+        let cmds = extract_shell_commands(text);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].cmd, "pwd && ls -la");
+    }
+
+    #[test]
     fn extracts_json_tool_call() {
         // The exact shape a reviewer emitted: a JSON tool-call block.
         let text = concat!(
