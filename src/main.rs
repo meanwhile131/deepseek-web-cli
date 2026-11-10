@@ -609,6 +609,14 @@ impl Reviewer {
     }
 }
 
+/// Whether a goal's opt-in turn budget has run out after `turn` turns.
+///
+/// `max_turns == 0` means unlimited (the default), so this is only ever true
+/// when the user explicitly set `DS_MAX_GOAL_TURNS` to a positive value.
+fn goal_budget_exhausted(max_turns: usize, turn: usize) -> bool {
+    max_turns != 0 && turn > max_turns
+}
+
 /// Drive the active goal to a *verified* completion, with no turn limit unless
 /// `DS_MAX_GOAL_TURNS` imposes one (see [`DEFAULT_MAX_GOAL_TURNS`]).
 ///
@@ -648,7 +656,7 @@ async fn run_goal_turns(
     let mut turn = 0usize;
     loop {
         turn += 1;
-        if max_turns != 0 && turn > max_turns {
+        if goal_budget_exhausted(max_turns, turn) {
             println!(
                 "{} stopped after {max_turns} turns without a verified {GOAL_DONE}; \
                  goal kept - continue with /goal <text> or clear with /goal clear",
@@ -2034,10 +2042,32 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        goal_completed, goal_continue_prompt, goal_start_prompt, parse_args, parse_goal_command,
-        parse_secrets, usage, with_goal, GoalCommand, ParsedArgs, SessionCache,
+        goal_budget_exhausted, goal_completed, goal_continue_prompt, goal_start_prompt, parse_args,
+        parse_goal_command, parse_secrets, usage, with_goal, GoalCommand, ParsedArgs, SessionCache,
+        DEFAULT_MAX_GOAL_TURNS,
     };
     use crate::sessions;
+
+    #[test]
+    fn goal_turns_are_unlimited_by_default() {
+        // The shipped default is "no budget": even a very long goal keeps
+        // reprompting instead of pausing at some fixed turn count.
+        assert_eq!(DEFAULT_MAX_GOAL_TURNS, 0, "default must mean unlimited");
+        for turn in [1, 25, 26, 1_000, usize::MAX / 2] {
+            assert!(
+                !goal_budget_exhausted(DEFAULT_MAX_GOAL_TURNS, turn),
+                "goal must not pause at turn {turn} with the default budget"
+            );
+        }
+    }
+
+    #[test]
+    fn an_opt_in_budget_still_pauses() {
+        assert!(!goal_budget_exhausted(3, 1));
+        assert!(!goal_budget_exhausted(3, 3));
+        assert!(goal_budget_exhausted(3, 4), "turn 4 exceeds a budget of 3");
+        assert!(goal_budget_exhausted(1, 2));
+    }
 
     #[test]
     fn no_goal_is_passthrough() {
