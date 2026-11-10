@@ -4,6 +4,7 @@ mod goals;
 mod login;
 mod markdown;
 mod pow;
+mod reviewer;
 mod sessions;
 mod shell;
 
@@ -116,9 +117,18 @@ fn spawn_sigint_handler(interrupt: &Interrupt) {
     });
 }
 
-/// How a turn ended, so callers can tell a completed turn from an aborted one.
+/// How a turn ended, so callers can tell a finished turn from an aborted one.
 enum TurnResult {
-    Done { completed: bool },
+    /// `claim` is the model's *unverified* claim that the active goal is done.
+    /// `/goal` never acts on it directly: [`review_goal_claim`] checks it
+    /// first.  A turn with no active goal always claims nothing.
+    ///
+    /// `report` is the visible text of the turn's last reply, handed to the
+    /// reviewer as the claim under examination.
+    Done {
+        claim: bool,
+        report: String,
+    },
     Interrupted,
 }
 
@@ -524,19 +534,103 @@ fn print_goal(goal: &Option<String>) {
     }
 }
 
-/// Reprompt the model until it declares the active goal complete, within a
-/// bounded budget (see [`DEFAULT_MAX_GOAL_TURNS`]).
+/// The separate conversation that checks `/goal` completion claims.
+///
+/// The worker's `[GOAL COMPLETE]` is only a *claim*: a model that is tired of
+/// the task, or that misjudged its own work, can emit it anyway.  Every claim
+/// is therefore handed to this reviewer, which
+///
+///   * runs in a brand-new conversation, so it is not biased by having
+///     written the work (and cannot see the worker's reasoning),
+///   * has the same shell access, so it can inspect the files, run the tests
+///     and look at the actual artifacts instead of trusting the report,
+///   * must end with an explicit verdict, which is parsed by
+///     [`reviewer::parse_verdict`].
+///
+/// A missing or unreadable verdict counts as "not achieved": an unverified
+/// claim never closes a goal.
+struct Reviewer {
+    bearer: String,
+    session_id: Option<String>,
+    policy: api::RetryPolicy,
+    http_timeout: std::time::Duration,
+}
+
+impl Reviewer {
+    fn new(
+        bearer: &str,
+        session_id: &Option<String>,
+        policy: api::RetryPolicy,
+        http_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            bearer: bearer.to_string(),
+            session_id: session_id.clone(),
+            policy,
+            http_timeout,
+        }
+    }
+
+    /// Have the reviewer examine `report` (the worker's completion claim) for
+    /// `goal` and return its full reply, verdict line included.
+    ///
+    /// The review runs as an ordinary turn in a fresh conversation: it may
+    /// issue shell commands and reads back their output, exactly like the
+    /// worker, and `run_turn` returns the visible text of its last reply.
+    async fn review(
+        &self,
+        goal: &str,
+        report: &str,
+        thinking: bool,
+        search: bool,
+        sandbox_root: &Option<std::path::PathBuf>,
+        interrupt: &Interrupt,
+    ) -> Result<String> {
+        let mut client = build_client(
+            &self.bearer,
+            &self.session_id,
+            self.policy,
+            self.http_timeout,
+        )?;
+        client.set_cancel(interrupt.subscribe());
+        let prompt = reviewer::review_prompt(goal, report);
+        // The reviewer must not carry the active-goal reminder: it is not
+        // working on the goal, it is judging it.
+        let no_goal = None;
+        let cfg = TurnConfig {
+            thinking,
+            search,
+            sandbox_root: sandbox_root.clone(),
+            debug_pending: false,
+            goal: &no_goal,
+        };
+        match run_turn(&mut client, ReplySource::Message(&prompt), &cfg, interrupt).await? {
+            TurnResult::Done { report, .. } => Ok(report),
+            TurnResult::Interrupted => anyhow::bail!("review interrupted"),
+        }
+    }
+}
+
+/// Drive the active goal to a *verified* completion, within a bounded budget
+/// (see [`DEFAULT_MAX_GOAL_TURNS`]).
 ///
 /// Shared by `/goal <text>` (which starts a new goal) and `/resume` (which
 /// restarts the goal saved with the conversation it just loaded).  Because the
 /// same loop runs in both cases, resuming a conversation with an active goal
 /// puts the model back to work instead of merely printing the saved text.
 ///
+/// The worker's `[GOAL COMPLETE]` is a claim, not a result: every claim is
+/// checked by [`Reviewer`] in a separate conversation.  Only an explicit
+/// `VERDICT: ACHIEVED` closes the goal.  A rejection (or a review that ends
+/// without a readable verdict) is fed back to the worker as its next
+/// instruction, so it keeps working on whatever the reviewer found missing.
+///
 /// `primed` is updated the same way as a normal turn: the system prompt is
 /// prepended only when the conversation is brand new.
 #[allow(clippy::too_many_arguments)]
 async fn run_goal_turns(
     client: &mut api::DeepSeekClient,
+    reviewer: &Reviewer,
     goal: &mut Option<String>,
     primed: &mut bool,
     label: &mut Option<String>,
@@ -549,21 +643,25 @@ async fn run_goal_turns(
 ) {
     let Some(text) = goal.clone() else { return };
     let max_turns = env_u64("DS_MAX_GOAL_TURNS", DEFAULT_MAX_GOAL_TURNS as u64).max(1) as usize;
+    // Feedback from a rejected review, sent to the worker instead of the
+    // generic "keep going" prompt.
+    let mut feedback: Option<String> = None;
+    let mut reviews = 0usize;
     let mut turn = 0usize;
     loop {
         turn += 1;
         if turn > max_turns {
             println!(
-                "{} stopped after {max_turns} turns without {GOAL_DONE}; \
+                "{} stopped after {max_turns} turns without a verified {GOAL_DONE}; \
                  goal kept - continue with /goal <text> or clear with /goal clear",
                 paint("1;33", "[goal paused]")
             );
             break;
         }
-        let base = if turn == 1 {
-            goal_start_prompt(&text)
-        } else {
-            goal_continue_prompt()
+        let base = match feedback.take() {
+            Some(f) => f,
+            None if turn == 1 => goal_start_prompt(&text),
+            None => goal_continue_prompt(),
         };
         let base = if *primed {
             base
@@ -579,17 +677,22 @@ async fn run_goal_turns(
             debug_pending,
             goal,
         };
-        let completed = match run_turn(client, ReplySource::Message(&message), &cfg, interrupt)
-            .await
+        let (claim, report) = match run_turn(
+            client,
+            ReplySource::Message(&message),
+            &cfg,
+            interrupt,
+        )
+        .await
         {
-            Ok(TurnResult::Done { completed }) => completed,
+            Ok(TurnResult::Done { claim, report }) => (claim, report),
             Ok(TurnResult::Interrupted) => {
                 // Stop reprompting; keep the goal so the user can resume it
                 // with /goal.
                 println!(
-                    "{} goal paused \u{2014} view with /goal show, restart with /goal <text> or drop with /goal clear",
-                    paint("1;33", "[interrupted]")
-                );
+                        "{} goal paused \u{2014} view with /goal show, restart with /goal <text> or drop with /goal clear",
+                        paint("1;33", "[interrupted]")
+                    );
                 break;
             }
             Err(e) => {
@@ -601,13 +704,116 @@ async fn run_goal_turns(
         // The first turn creates the conversation id; record the goal against
         // it now that one exists.
         persist_goal(client, goal);
-        if completed {
-            println!("{}", paint("32", "[goal completed]"));
-            *goal = None;
-            persist_goal(client, goal);
-            break;
+        if !claim {
+            println!("{} reprompting model (turn {turn})", paint("36", "[goal]"));
+            continue;
         }
-        println!("{} reprompting model (turn {turn})", paint("36", "[goal]"));
+
+        // The worker says it is done. Verify before believing it.
+        reviews += 1;
+        println!("{} checking the completion claim", paint("36", "[review]"));
+        let review = reviewer
+            .review(&text, &report, thinking, search, &sandbox_root, interrupt)
+            .await;
+        match review {
+            Ok(review) => match reviewer::parse_verdict(&review) {
+                Some(true) => {
+                    println!("{}", paint("32", "[goal completed]"));
+                    println!(
+                        "{} {} confirmed the goal",
+                        paint("32", "[review]"),
+                        paint("2", "reviewer")
+                    );
+                    *goal = None;
+                    persist_goal(client, goal);
+                    break;
+                }
+                Some(false) => {
+                    println!(
+                        "{} rejected the completion claim; sending the findings back",
+                        paint("1;33", "[review]")
+                    );
+                    feedback = Some(reviewer::feedback_prompt(&text, &review));
+                }
+                None => {
+                    println!(
+                        "{} no readable verdict; treating the claim as unverified",
+                        paint("1;33", "[review]")
+                    );
+                    feedback = Some(reviewer::feedback_prompt(&text, &review));
+                }
+            },
+            Err(e) => {
+                // A broken review must not silently accept the claim, but it
+                // also must not discard the user's goal: pause and let them
+                // retry.
+                eprintln!("{} review failed: {e:#}", paint("1;31", "[error]"));
+                println!(
+                    "{} goal kept unverified - continue with /goal <text> or clear with /goal clear",
+                    paint("1;33", "[goal paused]")
+                );
+                break;
+            }
+        }
+        println!(
+            "{} reprompting model (turn {turn}, {reviews} review{})",
+            paint("36", "[goal]"),
+            if reviews == 1 { "" } else { "s" }
+        );
+    }
+}
+
+/// Verify a completion claim that arrived from an ordinary turn.
+///
+/// `/goal` runs its own verify-then-reprompt loop ([`run_goal_turns`]);
+/// plain messages, `/continue` and resumed replies can also carry a
+/// `[GOAL COMPLETE]`, and those claims must not close a goal unchecked.  Here
+/// the reviewer gets one look: on `VERDICT: ACHIEVED` the goal is cleared,
+/// otherwise it stays active and the rejection is printed so the user (or the
+/// next `/goal`) knows why.
+#[allow(clippy::too_many_arguments)]
+async fn handle_goal_claim(
+    client: &mut api::DeepSeekClient,
+    reviewer: &Reviewer,
+    goal: &mut Option<String>,
+    report: &str,
+    thinking: bool,
+    search: bool,
+    sandbox_root: &Option<std::path::PathBuf>,
+    interrupt: &Interrupt,
+) {
+    let Some(text) = goal.clone() else { return };
+    println!("{} checking the completion claim", paint("36", "[review]"));
+    match reviewer
+        .review(&text, report, thinking, search, sandbox_root, interrupt)
+        .await
+    {
+        Ok(review) => match reviewer::parse_verdict(&review) {
+            Some(true) => {
+                println!("{}", paint("32", "[goal completed]"));
+                println!(
+                    "{} {} confirmed the goal",
+                    paint("32", "[review]"),
+                    paint("2", "reviewer")
+                );
+                *goal = None;
+                persist_goal(client, goal);
+            }
+            Some(false) => {
+                println!(
+                    "{} rejected the completion claim - goal kept; \
+                     run /goal to keep working on it",
+                    paint("1;33", "[review]")
+                );
+            }
+            None => {
+                println!(
+                    "{} no readable verdict - goal kept unverified",
+                    paint("1;33", "[review]")
+                );
+            }
+        },
+        Err(e) => eprintln!("{} review failed: {e:#}", paint("1;31", "[error]")),
     }
 }
 
@@ -872,7 +1078,9 @@ async fn run_turn(
             return Ok(TurnResult::Interrupted);
         }
     };
-    let mut completed = goal_completed(&pending) || goal_completed(&reasoning);
+    // A completion token anywhere in the turn is a *claim*; it is verified by
+    // the reviewer before the goal is actually closed.
+    let mut claim = goal_completed(&pending) || goal_completed(&reasoning);
     let mut iter = 0usize;
 
     // Shell loop: keep extracting commands from each reply
@@ -972,12 +1180,17 @@ async fn run_turn(
             }
         };
         if goal_completed(&v) || goal_completed(&r) {
-            completed = true;
+            claim = true;
         }
         pending = v;
         reasoning = r;
     }
-    Ok(TurnResult::Done { completed })
+    let report = if pending.trim().is_empty() {
+        reasoning.trim().to_string()
+    } else {
+        pending.trim().to_string()
+    };
+    Ok(TurnResult::Done { claim, report })
 }
 
 /// Largest page the `fetch_page` endpoint accepts; anything above is rejected
@@ -1308,6 +1521,8 @@ async fn main() -> Result<()> {
 
     let mut client = build_client(&bearer, &session_id, policy, http_timeout)?;
     client.set_cancel(interrupt.subscribe());
+    // The independent agent that verifies `/goal` completion claims.
+    let mut reviewer = Reviewer::new(&bearer, &session_id, policy, http_timeout);
 
     // Prove the token still works before starting the prompt loop.
     //
@@ -1493,6 +1708,7 @@ async fn main() -> Result<()> {
                                 // not just printing the saved text.
                                 run_goal_turns(
                                     &mut client,
+                                    &reviewer,
                                     &mut goal,
                                     &mut primed,
                                     &mut label,
@@ -1631,7 +1847,9 @@ async fn main() -> Result<()> {
                             Ok(email) => {
                                 fresh.set_cancel(interrupt.subscribe());
                                 client = fresh;
-                                let _ = &token;
+                                // The reviewer talks to the same account with
+                                // the same (possibly rotated) credential.
+                                reviewer.bearer = token.clone();
                                 println!("{} signed in as {email}", paint("32", "[login]"));
                             }
                             Err(e) => eprintln!(
@@ -1673,11 +1891,22 @@ async fn main() -> Result<()> {
                     goal: &goal,
                 };
                 match run_turn(&mut client, ReplySource::Continue, &cfg, &interrupt).await {
-                    Ok(TurnResult::Done { completed }) => {
+                    Ok(TurnResult::Done { claim, report }) => {
                         apply_pending_title(&client, &mut label, &mut pending_title).await;
-                        if completed && goal.is_some() {
-                            println!("{}", paint("32", "[goal completed]"));
-                            goal = None;
+                        if claim && goal.is_some() {
+                            // A resumed reply can carry a completion claim
+                            // too; verify it like any other.
+                            handle_goal_claim(
+                                &mut client,
+                                &reviewer,
+                                &mut goal,
+                                &report,
+                                thinking,
+                                search,
+                                &sandbox_root,
+                                &interrupt,
+                            )
+                            .await;
                         }
                         persist_goal(&client, &goal);
                     }
@@ -1705,6 +1934,7 @@ async fn main() -> Result<()> {
                         // DEFAULT_MAX_GOAL_TURNS).
                         run_goal_turns(
                             &mut client,
+                            &reviewer,
                             &mut goal,
                             &mut primed,
                             &mut label,
@@ -1743,14 +1973,25 @@ async fn main() -> Result<()> {
                 )
                 .await
                 {
-                    Ok(TurnResult::Done { completed }) => {
+                    Ok(TurnResult::Done { claim, report }) => {
                         apply_pending_title(&client, &mut label, &mut pending_title).await;
-                        if completed && goal.is_some() {
-                            println!("{}", paint("32", "[goal completed]"));
-                            goal = None;
+                        if claim && goal.is_some() {
+                            // Verify the completion claim before closing the
+                            // goal, exactly like `/goal` does.
+                            handle_goal_claim(
+                                &mut client,
+                                &reviewer,
+                                &mut goal,
+                                &report,
+                                thinking,
+                                search,
+                                &sandbox_root,
+                                &interrupt,
+                            )
+                            .await;
                         }
                         // Sync the store: a new conversation gets its goal
-                        // recorded, and completion clears the saved entry.
+                        // recorded, and a verified completion clears it.
                         persist_goal(&client, &goal);
                     }
                     // Turn cancelled by Ctrl+C: just return to the prompt.

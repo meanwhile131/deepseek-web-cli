@@ -138,7 +138,7 @@ a terminal or `NO_COLOR` is set; set `CLICOLOR_FORCE=1` to keep it when piping.
 | `/new` | start a fresh conversation (the old one stays resumable) |
 | `/continue` | resume the interrupted reply via `chat/continue` (no new completion charge, no proof of work) |
 | `/id` | show the current conversation tip |
-| `/goal <text>` | set a goal and let the model work until it reports completion |
+| `/goal <text>` | set a goal and let the model work until a **reviewer agent** verifies it is done |
 | `/goal`, `/goal show`, `/goal status` | show the active goal |
 | `/goal clear`, `none`, `off` | drop the active goal |
 | `/sessions` | list conversations, oldest first |
@@ -146,6 +146,30 @@ a terminal or `NO_COLOR` is set; set `CLICOLOR_FORCE=1` to keep it when piping.
 | `/resume <n|id-prefix>` | continue a saved conversation (restores its goal and reprompts the model to keep working on it) |
 | `/label <text>` | rename the current conversation |
 | `/forget <n|id-prefix>` | delete a conversation on the server |
+
+### How `/goal` decides a goal is done
+
+`/goal <text>` reprompts the model until it says the goal is complete. That
+statement is treated as a *claim*, not a result: a model that wants to stop can
+emit `[GOAL COMPLETE]` without having finished anything. Every claim is handed
+to a separate **reviewer agent** - a fresh conversation, not the one that did
+the work - which is given the goal and the worker's final report and told to
+check reality for itself. The reviewer has the same shell access, so it can
+read the changed files, run the tests and look at the artifacts instead of
+trusting the report.
+
+The reviewer must end with an explicit line:
+
+    VERDICT: ACHIEVED        - the goal really is done; the goal is cleared
+    VERDICT: NOT ACHIEVED    - it is not; the findings go back to the worker
+
+On a rejection the reviewer's findings are sent to the worker as its next
+instruction, so it keeps working on exactly what was found missing. A review
+that ends without a readable verdict is treated as a rejection: an unverified
+claim never closes a goal, and the goal stays saved so it can be resumed. If
+the review itself fails (network, API error) the goal is paused, not completed.
+The same check applies when a plain message, `/continue` or a resumed reply
+carries the completion token.
 
 ### Resuming a cut-short reply
 
@@ -194,7 +218,7 @@ a space to keep it out of the history.
 | `DS_RETRY_CAP_MS` | `300000` | backoff ceiling |
 | `DS_MIN_GAP_MS` | `1500` | minimum spacing between requests |
 | `DS_MAX_RETRIES` | `0` | retries per request before giving up (`0` = unlimited, the default) |
-| `DS_MAX_GOAL_TURNS` | `25` | completion requests `/goal` may spend before pausing |
+| `DS_MAX_GOAL_TURNS` | `25` | worker turns `/goal` may spend before pausing (each completion claim also costs one review turn) |
 | `DS_MAX_SHELL_ITERS` | `0` | shell round-trips per turn before stopping (`0` = unlimited) |
 | `DS_API_BASE` | `https://chat.deepseek.com` | origin API calls go to; point it at a mock server to test without the network |
 | `DS_SHUMEI_DEVICE_ID` | unset | optional `shumei_device_id` blob forwarded to `chat/continue` (the web client sends one; the endpoint works without it) |

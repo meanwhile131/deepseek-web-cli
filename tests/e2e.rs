@@ -228,6 +228,11 @@ fn session_created() -> Resp {
     Resp::json(r#"{"code":0,"data":{"biz_code":0,"biz_data":{"chat_session":{"id":"sess-e2e"}}}}"#)
 }
 
+/// `true` when a completion prompt is the reviewer's, not the worker's.
+fn is_review(prompt: &str) -> bool {
+    prompt.contains("strict, independent reviewer")
+}
+
 /// A PoW challenge whose target hash is reachable within `difficulty` guesses.
 ///
 /// `expire_at` is 0, which the solver treats as "never expires" - a real
@@ -564,12 +569,37 @@ fn shell_command_runs_and_its_output_is_sent_back_to_the_model() {
 }
 
 #[test]
-fn goal_is_reprompted_until_the_completion_token_appears() {
-    let mock = mock_api(|_req, n| {
-        if n < 2 {
-            sse_reply("still working on it")
-        } else {
+fn goal_is_reprompted_until_the_reviewer_confirms_completion() {
+    // Three voices in the mock: the worker (which claims completion twice),
+    // the reviewer (which first rejects, then accepts), and the shell.
+    let mock = mock_api(|req, _n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        if is_review(&prompt) {
+            assert!(
+                prompt.contains("Goal: tidy the repo"),
+                "reviewer must be told the goal: {prompt}"
+            );
+            if prompt.contains("removed the cruft") {
+                // Second review: the worker's report fixed the finding.
+                sse_reply("Checked the tree; clean.\nVERDICT: ACHIEVED")
+            } else {
+                assert!(
+                    prompt.contains("all done [GOAL COMPLETE]"),
+                    "reviewer must see the claim under examination: {prompt}"
+                );
+                sse_reply("README still has cruft.\nVERDICT: NOT ACHIEVED - tests fail")
+            }
+        } else if prompt.contains("Reviewer's verdict and findings") {
+            // The rejection was fed back to the worker.
+            assert!(
+                prompt.contains("README still has cruft"),
+                "worker must receive the reviewer's findings: {prompt}"
+            );
+            sse_reply("removed the cruft [GOAL COMPLETE]")
+        } else if prompt.contains("[ACTIVE GOAL] tidy the repo") {
             sse_reply("all done [GOAL COMPLETE]")
+        } else {
+            sse_reply("still working on it")
         }
     });
     let sb = Sandbox::new("goal");
@@ -577,12 +607,22 @@ fn goal_is_reprompted_until_the_completion_token_appears() {
     let out = run(
         &sb,
         &[],
-        &[("DS_API_BASE", &mock.base), ("DS_MAX_GOAL_TURNS", "5")],
+        &[("DS_API_BASE", &mock.base), ("DS_MAX_GOAL_TURNS", "8")],
         "/goal tidy the repo\nexit\n",
     );
     let text = stdout(&out);
 
     assert_contains(&text, "[goal set] tidy the repo", "goal command");
+    assert_contains(
+        &text,
+        "[review] checking the completion claim",
+        "review runs",
+    );
+    assert_contains(
+        &text,
+        "[review] rejected the completion claim",
+        "a rejected claim is reported",
+    );
     assert_contains(&text, "[goal completed]", "goal completion");
     assert!(
         !text.contains("[goal paused]"),
@@ -590,20 +630,59 @@ fn goal_is_reprompted_until_the_completion_token_appears() {
     );
 
     let completions = mock.requests_to("/api/v0/chat/completion");
-    assert_eq!(completions.len(), 3, "three goal turns");
-    // Every goal turn carries the active-goal reminder.
-    for (i, req) in completions.iter().enumerate() {
-        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
-        assert!(
-            prompt.contains("[ACTIVE GOAL] tidy the repo"),
-            "turn {i} should carry the goal: {prompt}"
-        );
-    }
+    // 2 worker turns + 2 reviews: the reviewer really is consulted twice.
+    assert_eq!(completions.len(), 4, "two worker turns and two reviews");
+    let reviews = completions
+        .iter()
+        .filter(|r| is_review(r.json()["prompt"].as_str().unwrap_or("")))
+        .count();
+    assert_eq!(reviews, 2, "one review per completion claim");
+
     // The goal is persisted against the conversation and cleared on completion.
     let store = std::fs::read_to_string(sb.file("goals.json")).unwrap_or_default();
     assert!(
         !store.contains("tidy the repo"),
         "completed goal must not stay in the store: {store}"
+    );
+}
+
+#[test]
+fn an_unverified_claim_does_not_complete_the_goal() {
+    // The worker always claims completion; the reviewer never gives a
+    // readable verdict.  The goal must stay open (and persisted).
+    let mock = mock_api(|req, _n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        if is_review(&prompt) {
+            sse_reply("Looks fine to me, I guess.")
+        } else {
+            sse_reply("done [GOAL COMPLETE]")
+        }
+    });
+    let sb = Sandbox::new("goal-unverified");
+
+    let out = run(
+        &sb,
+        &[],
+        &[("DS_API_BASE", &mock.base), ("DS_MAX_GOAL_TURNS", "3")],
+        "/goal tidy the repo\nexit\n",
+    );
+    let text = stdout(&out);
+
+    assert_contains(
+        &text,
+        "no readable verdict",
+        "a missing verdict must not be accepted",
+    );
+    assert!(
+        !text.contains("[goal completed]"),
+        "an unverified claim must not close the goal: {text}"
+    );
+    assert_contains(&text, "[goal paused]", "goal stays open after the budget");
+
+    let store = std::fs::read_to_string(sb.file("goals.json")).unwrap_or_default();
+    assert!(
+        store.contains("tidy the repo"),
+        "the unfinished goal must stay in the store: {store}"
     );
 }
 
