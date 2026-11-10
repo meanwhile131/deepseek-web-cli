@@ -832,6 +832,36 @@ fn a_reviewer_using_a_native_tool_call_still_runs_commands() {
 }
 
 #[test]
+fn a_reviewer_that_only_runs_commands_is_still_made_to_conclude() {
+    // The reviewer never gives a verdict, only ever asks for more shell
+    // commands. The nudge turn closes the shell, so its text is the answer and
+    // the loop cannot spin forever.
+    let mock = mock_api(|req, _n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        if prompt.contains("You did not finish with a verdict") {
+            // Shell is closed here, so this text is taken as the verdict.
+            sse_reply("Could not conclude.\nVERDICT: NOT ACHIEVED - no evidence")
+        } else if is_review(&prompt) {
+            sse_reply("<shell>echo e2e-review-loop</shell>")
+        } else {
+            sse_reply("done [GOAL COMPLETE]")
+        }
+    });
+    let sb = Sandbox::new("goal-review-loop");
+
+    let out = run(
+        &sb,
+        &[],
+        &[("DS_API_BASE", &mock.base), ("DS_MAX_GOAL_TURNS", "2")],
+        "/goal tidy the repo\nexit\n",
+    );
+    let text = stdout(&out);
+
+    assert_contains(&text, "e2e-review-loop", "the reviewer's command ran");
+    assert_contains(&text, "no evidence", "the nudge text became the verdict");
+}
+
+#[test]
 fn a_verdictless_review_is_nudged_once_in_the_same_conversation() {
     // The reviewer announces it will inspect the workspace but stops without
     // running anything or concluding. One nudge must follow in the same

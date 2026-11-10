@@ -632,6 +632,7 @@ impl Reviewer {
             sandbox_root: sandbox_root.clone(),
             debug_pending: false,
             goal: &no_goal,
+            allow_shell: true,
             follow_up_suffix: Some(reviewer::VERDICT_REMINDER),
         };
         let mut reply =
@@ -648,7 +649,20 @@ impl Reviewer {
                 reviewer::NO_COMMAND_NUDGE,
                 reviewer::VERDICT_REMINDER
             );
-            match run_turn(&mut client, ReplySource::Message(&nudge), &cfg, interrupt).await? {
+            // The review is over; close the shell for the nudge so the model
+            // has to conclude instead of starting another inspection loop.
+            let closing = TurnConfig {
+                allow_shell: false,
+                ..cfg
+            };
+            match run_turn(
+                &mut client,
+                ReplySource::Message(&nudge),
+                &closing,
+                interrupt,
+            )
+            .await?
+            {
                 TurnResult::Done { report, .. } => reply = report,
                 TurnResult::Interrupted => anyhow::bail!("review interrupted"),
             }
@@ -730,6 +744,7 @@ async fn run_goal_turns(
             sandbox_root: sandbox_root.clone(),
             debug_pending,
             goal,
+            allow_shell: true,
             follow_up_suffix: None,
         };
         let (claim, report) = match run_turn(
@@ -1112,6 +1127,11 @@ struct TurnConfig<'a> {
     sandbox_root: Option<std::path::PathBuf>,
     debug_pending: bool,
     goal: &'a Option<String>,
+    /// Whether shell commands in the model's reply may be run.
+    ///
+    /// The reviewer's nudge turn sets this false: the review is over and
+    /// the model must conclude, not start another round of inspection.
+    allow_shell: bool,
     /// Appended to every shell-output follow-up in this turn.
     ///
     /// The reviewer needs this: its conversation has no system prompt and its
@@ -1148,6 +1168,16 @@ async fn run_turn(
     // (initial + every follow-up) until the model stops. The loop is unlimited
     // by default; `DS_MAX_SHELL_ITERS` can impose an optional request budget.
     let max_iters = env_u64("DS_MAX_SHELL_ITERS", DEFAULT_MAX_SHELL_ITERS as u64) as usize;
+    if !cfg.allow_shell {
+        // Shell is closed for this turn: take the model's text as its answer,
+        // so a final turn cannot start another round of inspection.
+        let report = if pending.trim().is_empty() {
+            reasoning.trim().to_string()
+        } else {
+            pending.trim().to_string()
+        };
+        return Ok(TurnResult::Done { claim, report });
+    }
     loop {
         iter += 1;
         if max_iters != 0 && iter > max_iters {
@@ -1954,6 +1984,7 @@ async fn main() -> Result<()> {
                     sandbox_root: sandbox_root.clone(),
                     debug_pending,
                     goal: &goal,
+                    allow_shell: true,
                     follow_up_suffix: None,
                 };
                 match run_turn(&mut client, ReplySource::Continue, &cfg, &interrupt).await {
@@ -2030,6 +2061,7 @@ async fn main() -> Result<()> {
                     sandbox_root: sandbox_root.clone(),
                     debug_pending,
                     goal: &goal,
+                    allow_shell: true,
                     follow_up_suffix: None,
                 };
                 match run_turn(
