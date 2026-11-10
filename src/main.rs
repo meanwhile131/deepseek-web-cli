@@ -612,7 +612,15 @@ impl Reviewer {
             self.http_timeout,
         )?;
         client.set_cancel(interrupt.subscribe());
-        let prompt = reviewer::review_prompt(goal, report);
+        // The review runs in a brand-new conversation, so it needs the same
+        // opening system prompt the worker gets: that is where the shell tool
+        // contract lives. Without it the reviewer only has whatever the review
+        // prompt repeats and tends to invent its own command syntax.
+        let prompt = format!(
+            "{}\n\n{}",
+            system_prompt(),
+            reviewer::review_prompt(goal, report)
+        );
         // The reviewer must not carry the active-goal reminder: it is not
         // working on the goal, it is judging it.
         let no_goal = None;

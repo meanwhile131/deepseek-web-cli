@@ -585,6 +585,13 @@ fn goal_is_reprompted_until_the_reviewer_confirms_completion() {
                 prompt.contains("<shell>") && prompt.contains("[SHELL OUTPUT]"),
                 "reviewer must be told how to run commands: {prompt}"
             );
+            // The review runs in a fresh conversation, so it must carry the
+            // worker's opening system prompt too - that is where the shell
+            // tool contract lives and what keeps models on the documented form.
+            assert!(
+                prompt.starts_with("You are a helpful assistant with a local shell."),
+                "reviewer conversation must open with the system prompt: {prompt}"
+            );
             if prompt.contains("removed the cruft") {
                 // Second review: the worker's report fixed the finding.
                 sse_reply("Checked the tree; clean.\nVERDICT: ACHIEVED")

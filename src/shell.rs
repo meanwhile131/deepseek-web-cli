@@ -616,6 +616,16 @@ mod tests {
     }
 
     #[test]
+    fn extracts_multiline_bash_blocks() {
+        // Multi-line bodies and two blocks in one reply must both work.
+        let text = "<bash>\npwd && ls -la\n</bash>\n\n<bash>\nfind . -type f | head -200\n</bash>";
+        let cmds = extract_shell_commands(text);
+        assert_eq!(cmds.len(), 2, "{cmds:?}");
+        assert_eq!(cmds[0].cmd, "pwd && ls -la");
+        assert_eq!(cmds[1].cmd, "find . -type f | head -200");
+    }
+
+    #[test]
     fn accepts_common_tag_aliases() {
         // Models drift into other tag names; a reviewer using one must still
         // be able to run its commands.
