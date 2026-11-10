@@ -653,6 +653,98 @@ fn goal_is_reprompted_until_the_reviewer_confirms_completion() {
 }
 
 #[test]
+fn a_reviewer_using_an_alternate_tag_still_runs_commands() {
+    // The documented tag is the block form, but a model can reach for a short
+    // alias. It must still run, or the reviewer has no evidence at all.
+    let mock = mock_api(|req, _n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        if prompt.contains("=== CMD:") && !prompt.contains("[ACTIVE GOAL]") {
+            sse_reply("Checked.\nVERDICT: ACHIEVED")
+        } else if is_review(&prompt) {
+            sse_reply("\x3ccmd\x3eecho e2e-cmd-alias-ran\x3c/cmd\x3e")
+        } else {
+            sse_reply("done [GOAL COMPLETE]")
+        }
+    });
+    let sb = Sandbox::new("goal-cmd-alias");
+
+    let out = run(
+        &sb,
+        &[],
+        &[("DS_API_BASE", &mock.base)],
+        "/goal tidy the repo\nexit\n",
+    );
+    let text = stdout(&out);
+
+    assert_contains(&text, "e2e-cmd-alias-ran", "alias command output");
+    assert_contains(
+        &text,
+        "[goal completed]",
+        "goal completes after real evidence",
+    );
+}
+
+#[test]
+fn a_reviewer_using_a_native_tool_call_still_runs_commands() {
+    // The reviewer is told the tag form, but a model can still answer with its
+    // native tool-call syntax. Those commands must actually run: otherwise the
+    // reviewer gets no shell output and can only judge the report.
+    let mock = mock_api(|req, _n| {
+        let prompt = req.json()["prompt"].as_str().unwrap_or("").to_string();
+        // The reviewer's *follow-up* turn is the shell output it asked for;
+        // it does not carry the review instructions, only the executed
+        // command. The worker's follow-ups carry an active goal, so the two
+        // are told apart by that marker.
+        if prompt.contains("=== CMD:") && !prompt.contains("[ACTIVE GOAL]") {
+            sse_reply("Checked the output.\nVERDICT: ACHIEVED")
+        } else if is_review(&prompt) {
+            sse_reply(concat!(
+                "<|d|> invoke name=\"shell\">\n",
+                "<|d|> parameter name=\"command\" string=\"true\">echo e2e-reviewer-ran</|d|> parameter>\n",
+                "</|d|> invoke>"
+            ))
+        } else {
+            sse_reply("done [GOAL COMPLETE]")
+        }
+    });
+    let sb = Sandbox::new("goal-native-tool-call");
+
+    let out = run(
+        &sb,
+        &[],
+        &[("DS_API_BASE", &mock.base)],
+        "/goal tidy the repo\nexit\n",
+    );
+    let text = stdout(&out);
+
+    assert_contains(&text, "echo e2e-reviewer-ran", "reviewer command announced");
+    assert_contains(&text, "e2e-reviewer-ran", "reviewer command output");
+    assert_contains(
+        &text,
+        "[goal completed]",
+        "goal completes after real evidence",
+    );
+
+    // The review's first turn emitted a command, and the output came back as
+    // a follow-up turn in the same (reviewer) conversation.
+    assert_contains(&text, "--- output ---", "reviewer shell output is shown");
+    assert_contains(&text, "e2e-reviewer-ran\n", "reviewer sees what it ran");
+    let requests = mock.requests_to("/api/v0/chat/completion");
+    let worker_turns = requests
+        .iter()
+        .filter(|r| {
+            let p = r.json()["prompt"].as_str().unwrap_or("").to_string();
+            p.contains("[ACTIVE GOAL]")
+        })
+        .count();
+    assert_eq!(
+        requests.len(),
+        worker_turns + 2,
+        "one review turn plus its shell follow-up"
+    );
+}
+
+#[test]
 fn an_unverified_claim_does_not_complete_the_goal() {
     // The worker always claims completion; the reviewer never gives a
     // readable verdict.  The goal must stay open (and persisted).

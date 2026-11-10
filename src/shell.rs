@@ -318,8 +318,6 @@ fn ceil_boundary(s: &str, mut i: usize) -> usize {
 
 // Tag delimiters, spelled with escapes so this source file does not itself
 // contain a literal shell-tag pair.
-const OPEN: &str = "\x3cshell";
-const CLOSE: &str = "\x3c/shell\x3e";
 
 /// Parse a duration attribute value such as `30`, `30s`, `2m`, `1h`, `500ms`.
 fn parse_duration(raw: &str) -> Option<Duration> {
@@ -355,41 +353,150 @@ fn parse_timeout_attr(attrs: &str) -> Option<Duration> {
     None
 }
 
+/// Find an attribute of the form `name = "value"` (either quote style,
+/// whitespace allowed around `=`) and return the byte offset of `name`.
+///
+/// Used to read the native tool-call shape some models emit instead of the
+/// tag form: an `invoke name="shell"` header wrapping a
+/// `parameter name="command"` element.
+fn find_name_attr(haystack: &str, value: &str) -> Option<usize> {
+    let mut search = 0usize;
+    while let Some(i) = haystack[search..].find("name") {
+        let abs = search + i;
+        let rest = haystack[abs + "name".len()..].trim_start();
+        if let Some(rest) = rest.strip_prefix('=') {
+            let rest = rest.trim_start();
+            for q in ['"', '\''] {
+                if let Some(rest) = rest.strip_prefix(q) {
+                    if let Some(rest) = rest.strip_prefix(value) {
+                        if rest.starts_with(q) {
+                            return Some(abs);
+                        }
+                    }
+                }
+            }
+        }
+        search = abs + "name".len();
+    }
+    None
+}
+
+/// Recover commands from a native tool-call syntax, e.g.
+///
+/// ```text
+/// <|...|> invoke name="shell">
+/// <|...|> parameter name="command">ls -la</|...|> parameter>
+/// </|...|> invoke>
+/// ```
+///
+/// The delimiters around those elements vary between models, so only the
+/// `name=...` attributes and the body of the `command` parameter are matched.
+/// A reviewer that reaches for this shape must still be able to run commands:
+/// silently running nothing would leave it without evidence.
+fn extract_tool_call_commands(text: &str) -> Vec<ShellCommand> {
+    let mut cmds = Vec::new();
+    let mut rest = text;
+    while let Some(invoke) = find_name_attr(rest, "shell") {
+        let after_invoke = &rest[invoke..];
+        let Some(param) = find_name_attr(after_invoke, "command") else {
+            break;
+        };
+        let after_param = &after_invoke[param..];
+        let Some(gt) = after_param.find('>') else {
+            break;
+        };
+        let body = &after_param[gt + 1..];
+        let end = body.find("</").unwrap_or(body.len());
+        let cmd = body[..end].trim();
+        if !cmd.is_empty() {
+            cmds.push(ShellCommand {
+                cmd: cmd.to_string(),
+                timeout: default_timeout(),
+            });
+        }
+        if end >= body.len() {
+            break;
+        }
+        rest = &body[end..];
+    }
+    cmds
+}
+
+/// Opening tag names accepted for a command block.
+///
+/// `<shell>` is the documented form. The aliases exist because models drift
+/// into other tag names - `<cmd>`, `<command>`, `<bash>` - and a reviewer that
+/// used one would otherwise run nothing and be left without evidence.
+const OPEN_TAGS: [&str; 4] = ["\x3cshell", "\x3ccmd", "\x3ccommand", "\x3cbash"];
+
+/// Extract one command block starting at `start` (which points at `<`).
+///
+/// Returns the command, the index just past the block, and the attributes of
+/// the opening tag. `None` means the text at `start` is not a usable block.
+fn take_tag_block(text: &str, start: usize, open: &str) -> Option<(ShellCommand, usize, usize)> {
+    // A short tail (`...<cm`) must simply not match.
+    let after_name = text.get(start + open.len()..)?;
+    // The tag name must be followed by whitespace or `>` so we do not match
+    // something like `<shellfish>`.
+    match after_name.chars().next() {
+        Some('>') => {}
+        Some(c) if c.is_whitespace() => {}
+        _ => return None,
+    }
+    let gt = after_name.find('>')?;
+    let attrs = &after_name[..gt];
+    let body_start = start + open.len() + gt + 1;
+    let name = &open[1..];
+    let close = format!("\x3c/{name}\x3e");
+    let end = text[body_start..].find(&close)?;
+    let cmd = text[body_start..body_start + end].trim().to_string();
+    if cmd.is_empty() {
+        return None;
+    }
+    let timeout = parse_timeout_attr(attrs).unwrap_or_else(default_timeout);
+    Some((
+        ShellCommand { cmd, timeout },
+        attrs.len(),
+        body_start + end + close.len(),
+    ))
+}
+
 /// Extract shell command blocks from model output.
 ///
 /// Supported forms:
 ///   plain block                        -> default timeout
 ///   block with `timeout="30"` attr     -> 30 seconds
 ///   block with `timeout=2m` attr       -> 2 minutes
+///   `<cmd>`, `<command>`, `<bash>`     -> aliases for the block tag
 pub fn extract_shell_commands(text: &str) -> Vec<ShellCommand> {
     let mut cmds = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(OPEN) {
-        let after_name = &rest[start + OPEN.len()..];
-        // The tag name must be followed by whitespace or `>` so we do not
-        // match something like `<shellfish>`.
-        let ok = match after_name.chars().next() {
-            Some('>') => true,
-            Some(c) if c.is_whitespace() => true,
-            _ => false,
-        };
-        if !ok {
-            rest = after_name;
+    let mut i = 0usize;
+    while i < text.len() {
+        // Step over whole characters: indexing at a non-boundary would panic.
+        let ch = text[i..].chars().next().unwrap_or_default();
+        if ch != '\x3c' {
+            i += ch.len_utf8().max(1);
             continue;
         }
-        // Find the `>` that closes the opening tag.
-        let Some(gt) = after_name.find('>') else {
-            break;
-        };
-        let attrs = &after_name[..gt];
-        let body_start = start + OPEN.len() + gt + 1;
-        let Some(end) = rest[body_start..].find(CLOSE) else {
-            break;
-        };
-        let cmd = rest[body_start..body_start + end].trim().to_string();
-        let timeout = parse_timeout_attr(attrs).unwrap_or_else(default_timeout);
-        cmds.push(ShellCommand { cmd, timeout });
-        rest = &rest[body_start + end + CLOSE.len()..];
+        let mut advanced = false;
+        for open in OPEN_TAGS {
+            if let Some((cmd, _, next)) = take_tag_block(text, i, open) {
+                cmds.push(cmd);
+                i = next;
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
+            i += 1;
+        }
+    }
+    // Tolerate the native tool-call shape as well, so a model that reaches
+    // for it instead of the tag form still runs its commands.
+    for cmd in extract_tool_call_commands(text) {
+        if !cmds.iter().any(|c| c.cmd == cmd.cmd) {
+            cmds.push(cmd);
+        }
     }
     cmds
 }
@@ -398,9 +505,55 @@ pub fn extract_shell_commands(text: &str) -> Vec<ShellCommand> {
 mod tests {
     use super::*;
 
+    /// Spelled with escapes so this source file does not itself contain a
+    /// literal shell-tag pair.
+    const OPEN: &str = "\x3cshell";
+    const CLOSE: &str = "\x3c/shell\x3e";
+
     /// Build a shell block without writing the literal tag pair.
     fn block(attrs: &str, body: &str) -> String {
         format!("{OPEN}{attrs}\x3e{body}{CLOSE}")
+    }
+
+    #[test]
+    fn accepts_common_tag_aliases() {
+        // Models drift into other tag names; a reviewer using one must still
+        // be able to run its commands.
+        for name in ["cmd", "command", "bash"] {
+            let text = format!("\x3c{name}\x3epwd\x3c/{name}\x3e");
+            let cmds = extract_shell_commands(&text);
+            assert_eq!(cmds.len(), 1, "{name}: {cmds:?}");
+            assert_eq!(cmds[0].cmd, "pwd");
+        }
+        // A near-miss must not be treated as a block.
+        let text = "<cmdx>pwd</cmdx>";
+        assert!(extract_shell_commands(text).is_empty());
+    }
+
+    #[test]
+    fn extracts_native_tool_call_syntax() {
+        // Some models answer with their native tool-call shape instead of the
+        // documented tag form. The command must still run: a reviewer that
+        // reaches for this shape would otherwise get no evidence at all.
+        let text = concat!(
+            "<|delim|> calls\n",
+            "<|delim|> invoke name=\"shell\">\n",
+            "<|delim|> parameter name=\"command\" string=\"true\">pwd && ls</|delim|> parameter>\n",
+            "</|delim|> invoke>\n"
+        );
+        let cmds = extract_shell_commands(text);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].cmd, "pwd && ls");
+    }
+
+    #[test]
+    fn tag_form_and_tool_call_form_are_not_duplicated() {
+        let text = format!(
+            "{}\n<|d|> invoke name=\"shell\"><|d|> parameter name=\"command\">ls</|d|> parameter></|d|> invoke>",
+            block("", "ls")
+        );
+        let cmds = extract_shell_commands(&text);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
     }
 
     #[test]

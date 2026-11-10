@@ -21,13 +21,14 @@ use tokio::sync::watch;
 /// reviewer's prompt: the reviewer inspects the workspace with the same shell,
 /// so it must be told the same command format the worker is.
 ///
-/// The "no other syntax" clause is load-bearing: the extractor in
-/// [`shell::extract_shell_commands`] only understands the tag form below, so a
-/// model that reaches for a different tool-call syntax (JSON, function calls,
-/// other tag conventions) runs nothing and silently loses its evidence.
+/// The "no other syntax" clause is load-bearing: the documented form below is
+/// the one that reliably runs. [`shell::extract_shell_commands`] also recovers
+/// a few drifted forms (`<cmd>`, `<bash>`, native `invoke name="shell"` tool
+/// calls) as a safety net, but those are best-effort - a model that invents
+/// its own syntax runs nothing and silently loses its evidence.
 pub(crate) const SHELL_INSTRUCTIONS: &str = r#"The ONLY way to run a command is a block of exactly this form (never in reasoning, never in markdown fences):
 <shell>command goes here</shell>
-Any other tool-call syntax (JSON, function calls, other tag names) is ignored and runs nothing.
+Do not use any other tool-call syntax (JSON, function calls, other tag names): it may be ignored, and then nothing runs.
 One command per block; batch several per reply. Blocks run automatically; output returns as [SHELL OUTPUT].
 Commands run in the current directory. The rest of the filesystem is read-only (bubblewrap/sandbox-exec), so do not write outside it; HOME is your real home directory and is read-only there."#;
 
