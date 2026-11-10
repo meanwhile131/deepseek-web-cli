@@ -38,18 +38,22 @@ pub fn review_prompt(goal: &str, report: &str) -> String {
          \n\
          Goal: {goal}\n\
          \n\
+         You have a local shell, exactly like the worker had: you can run commands\n\
+         yourself and read their output, and you are expected to do so rather than\n\
+         judging the report on its own.\n\
+         \n\
+         {SHELL_INSTRUCTIONS}\n\
+         \n\
          It now claims the goal is complete. Its final report:\n\
          \n\
          ---\n\
          {report}\n\
          ---\n\
          \n\
-         Verify the claim against reality, not against the report. Inspect the workspace with\n\
-         shell commands - read the changed files, run the tests, check the artifacts - when that\n\
-         is possible from here. The goal text is the standard; a claim without evidence is not\n\
-         an achievement, and partial work is not an achievement.\n\
-         \n\
-         {SHELL_INSTRUCTIONS}\n\
+         Verify the claim against reality, not against the report. Read the changed\n\
+         files, run the tests, check the artifacts. The goal text is the standard; a\n\
+         claim without evidence is not an achievement, and partial work is not an\n\
+         achievement.\n\
          \n\
          Be concise. Say what you checked and what is missing, then finish your reply with\n\
          exactly one line, on its own:\n\
@@ -137,6 +141,7 @@ mod tests {
         // uses; without the command format it cannot act on "inspect the
         // workspace" and can only judge the report.
         let p = review_prompt("fix the bug", "I fixed it [GOAL COMPLETE]");
+        assert!(p.contains("You have a local shell"), "{p}");
         assert!(p.contains(crate::SHELL_INSTRUCTIONS), "{p}");
         assert!(p.contains("<shell>"), "{p}");
         assert!(p.contains("[SHELL OUTPUT]"), "{p}");
